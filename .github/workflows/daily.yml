@@ -1,7 +1,7 @@
 name: Daily RSI-SuperTrend (Discord)
 on:
   schedule:
-    - cron: "5 0 * * *"   # 00:05 UTC every day (after daily candle)
+    - cron: "5 0 * * *"   # 00:05 UTC daily
   workflow_dispatch:       # manual run button
 
 jobs:
@@ -12,6 +12,17 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v4
 
+      - name: Show repo layout (sanity)
+        run: |
+          echo "Repo root:"
+          ls -la
+          echo ""
+          echo "RSPS-MAIN:"
+          ls -la RSPS-MAIN || true
+          echo ""
+          echo ".github/workflows:"
+          ls -la .github/workflows || true
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -20,26 +31,24 @@ jobs:
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
 
-      # Pinned versions to avoid build issues on the runner
+      # Pinned versions to avoid compile/import issues
       - name: Install deps (pinned)
         run: |
           pip install "numpy==1.26.4" "pandas==2.2.2" "matplotlib==3.9.2" \
                       "yfinance==0.2.52" "ta==0.11.0" "requests>=2.31"
 
-      - name: Show environment
+      - name: Verify script exists
         run: |
-          python -V
-          python -c "import sys, numpy, pandas, matplotlib; \
-                     print('numpy', numpy.__version__); \
-                     print('pandas', pandas.__version__); \
-                     print('matplotlib', matplotlib.__version__); \
-                     print('platform', sys.platform)"
+          test -f RSPS-MAIN/DISCORDBOT.py || (echo "❌ RSPS-MAIN/DISCORDBOT.py not found. Check path/filename/case." && exit 1)
 
       - name: Run strategy and send to Discord
-        run: python adaptive_strength_rsi_supertrend_auto.py
+        run: python RSPS-MAIN/DISCORDBOT.py
 
+      # Your script saves the PNG to the current working directory.
+      # If you changed it to save inside RSPS-MAIN, switch the path below to RSPS-MAIN/equity_curve_*.png
       - name: Upload chart artifact
         uses: actions/upload-artifact@v4
         with:
           name: equity-curve
           path: equity_curve_*.png
+
