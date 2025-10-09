@@ -12,11 +12,17 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v4
 
+      # Show where everything actually is (case-sensitive on Linux)
       - name: Show repo layout
         run: |
-          echo "Repo root:" && ls -la
-          echo "" && echo "RSPS-main:" && ls -la "RSPS-main" || true
-          echo "" && echo ".github/workflows:" && ls -la .github/workflows || true
+          echo "== Repo root =="
+          ls -la
+          echo
+          echo "== First two levels =="
+          find . -maxdepth 2 -type d -print | sort
+          echo
+          echo "== Any files matching *discordbot* (any case) =="
+          find . -maxdepth 3 -type f -iname '*discordbot*' -print | sort || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -31,17 +37,40 @@ jobs:
           pip install "numpy==1.26.4" "pandas==2.2.2" "matplotlib==3.9.2" \
                       "yfinance==0.2.52" "ta==0.11.0" "requests>=2.31"
 
-      - name: Verify script path
+      # Auto-detect your script location/name (handles no extension or .py, any case)
+      - name: Locate and run DISCORDBOT
         run: |
-          test -f "RSPS-main/DISCORDBOT" || (echo "❌ RSPS-main/DISCORDBOT not found (case/extension?)." && exit 1)
+          set -euo pipefail
+          echo "Searching for your script…"
+          CANDIDATES=$( \
+            printf '%s\n' \
+              "RSPS-main/DISCORDBOT" \
+              "RSPS-main/DISCORDBOT.py" \
+              "RSPS-MAIN/DISCORDBOT" \
+              "RSPS-MAIN/DISCORDBOT.py" \
+            ; find . -maxdepth 3 -type f -iname 'discordbot' -o -iname 'discordbot.py' \
+          )
+          FOUND=""
+          while IFS= read -r p; do
+            [ -f "$p" ] && FOUND="$p" && break
+          done <<< "$CANDIDATES"
 
-      - name: Run DISCORDBOT
-        run: python "RSPS-main/DISCORDBOT"
+          if [ -z "$FOUND" ]; then
+            echo "❌ Could not find a file named DISCORDBOT (with or without .py)."
+            echo "Check the 'Show repo layout' step above to see actual paths/case."
+            exit 1
+          fi
+          echo "✅ Found script: $FOUND"
+          python "$FOUND"
 
+      # Try both RSPS-main/ and RSPS-MAIN/ for the image artifact
       - name: Upload chart artifact
         uses: actions/upload-artifact@v4
         with:
           name: equity-curve
-          path: RSPS-main/equity_curve_*.png
+          path: |
+            RSPS-main/equity_curve_*.png
+            RSPS-MAIN/equity_curve_*.png
+
 
 
