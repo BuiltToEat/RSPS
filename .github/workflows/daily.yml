@@ -2,7 +2,7 @@ name: Daily RSI-SuperTrend (Discord)
 on:
   schedule:
     - cron: "5 0 * * *"   # 00:05 UTC daily
-  workflow_dispatch:       # manual run button
+  workflow_dispatch:
 
 jobs:
   run:
@@ -12,16 +12,11 @@ jobs:
       - name: Check out repo
         uses: actions/checkout@v4
 
-      - name: Show repo layout (sanity)
+      - name: Show repo layout
         run: |
-          echo "Repo root:"
-          ls -la
-          echo ""
-          echo "RSPS-MAIN:"
-          ls -la RSPS-MAIN || true
-          echo ""
-          echo ".github/workflows:"
-          ls -la .github/workflows || true
+          echo "Repo root:" && ls -la
+          echo "" && echo "RSPS-MAIN:" && ls -la RSPS-MAIN || true
+          echo "" && echo ".github/workflows:" && ls -la .github/workflows || true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -31,24 +26,32 @@ jobs:
       - name: Upgrade pip
         run: python -m pip install --upgrade pip
 
-      # Pinned versions to avoid compile/import issues
       - name: Install deps (pinned)
         run: |
           pip install "numpy==1.26.4" "pandas==2.2.2" "matplotlib==3.9.2" \
                       "yfinance==0.2.52" "ta==0.11.0" "requests>=2.31"
 
-      - name: Verify script exists
+      # Optional: quick preflight ping to ensure the webhook works from CI
+      - name: Discord preflight ping
         run: |
-          test -f RSPS-MAIN/DISCORDBOT.py || (echo "❌ RSPS-MAIN/DISCORDBOT.py not found. Check path/filename/case." && exit 1)
+          python - << 'PY'
+          import requests
+          url = "https://discord.com/api/webhooks/PASTE_YOUR_NEW_WEBHOOK_HERE"
+          r = requests.post(url, json={"content":"CI preflight ✅"})
+          print("Discord preflight:", r.status_code, r.text[:200])
+          assert r.status_code in (200, 204), "Discord webhook ping failed"
+          PY
 
-      - name: Run strategy and send to Discord
+      - name: Verify script path
+        run: |
+          test -f RSPS-MAIN/DISCORDBOT.py || (echo "❌ RSPS-MAIN/DISCORDBOT.py not found." && exit 1)
+
+      - name: Run DISCORDBOT
         run: python RSPS-MAIN/DISCORDBOT.py
 
-      # Your script saves the PNG to the current working directory.
-      # If you changed it to save inside RSPS-MAIN, switch the path below to RSPS-MAIN/equity_curve_*.png
       - name: Upload chart artifact
         uses: actions/upload-artifact@v4
         with:
           name: equity-curve
-          path: equity_curve_*.png
+          path: RSPS-MAIN/equity_curve_*.png
 
