@@ -44,10 +44,10 @@ jobs:
 
       - name: Verify script path
         run: |
-          test -f RSPS-MAIN/DISCORDBOT.py || (echo "❌ RSPS-MAIN/DISCORDBOT.py not found." && exit 1)
+          test -f RSPS-MAIN/DISCORDBOT || (echo "❌ RSPS-MAIN/DISCORDBOT not found." && exit 1)
 
       - name: Run DISCORDBOT
-        run: python RSPS-MAIN/DISCORDBOT.py
+        run: python RSPS-MAIN/DISCORDBOT
 
       - name: Upload chart artifact
         uses: actions/upload-artifact@v4
