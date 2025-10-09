@@ -1,0 +1,19 @@
+name: Daily RSI-SuperTrend (Discord)
+on:
+  schedule:
+    - cron: "5 0 * * *"   # 00:05 UTC daily
+  workflow_dispatch:       # manual run button
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install yfinance pandas numpy ta requests matplotlib
+      - name: Run strategy and send to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python adaptive_strength_rsi_supertrend_auto.py
