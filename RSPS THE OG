@@ -1,0 +1,300 @@
+# RSPS THE OG
+# Long-only Top-3 crypto strategy with RSI + SuperTrend
+# Data: CryptoCompare (avoids Yahoo throttling)
+# Fees: turnover-based daily fee applied (FEE_RATE)
+# Output: saves PNG and posts PNG + metrics (P&L, Sharpe, Sortino, Max DD, holdings) to Discord
+
+import os, time, random
+from datetime import datetime, timezone, date
+import requests
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from ta.momentum import RSIIndicator
+from ta.trend import EMAIndicator
+
+# ---------- CONFIG ----------
+TICKERS = [
+    "BTC-USD","ETH-USD","BNB-USD","SOL-USD","ADA-USD",
+    "XRP-USD","DOGE-USD","DOT-USD","LINK-USD","MATIC-USD",
+    "AVAX-USD","LTC-USD","UNI-USD","ATOM-USD","ETC-USD",
+    "FIL-USD","XLM-USD","HBAR-USD","NEAR-USD"
+]
+START_DATE = "2020-01-01"
+TOP_N = 3
+
+RSI_WIN   = 14
+ATR_WIN   = 10
+ATR_MULT  = 3.0
+RSI_THRESH= 55
+DD_TRIGGER= 0.15
+VOL_WIN   = 30
+FEE_RATE  = 0.001   # 0.1% round-trip on turnover (applied daily)
+np.seterr(divide="ignore", invalid="ignore")
+
+# ---------- DISCORD ----------
+DISCORD_WEBHOOK_URL = "https://canary.discord.com/api/webhooks/1425769640876965990/rJb62mNKfI5aKUeUxNHkPjZ424c3gd3qaWo6IFeY5Y1RwI_Fu_yyWqn33OY6vHm69efE"
+
+def send_discord_text(content: str):
+    try:
+        r = requests.post(DISCORD_WEBHOOK_URL, json={"content": content}, timeout=25)
+        print(f"Discord text status: {r.status_code}")
+    except Exception as e:
+        print(f"Discord text error: {e}")
+
+def send_discord_image(caption: str, image_path: str):
+    try:
+        with open(image_path, "rb") as f:
+            files = {"file": (os.path.basename(image_path), f, "image/png")}
+            data = {"content": caption}
+            r = requests.post(DISCORD_WEBHOOK_URL, data=data, files=files, timeout=60)
+        print(f"Discord image status: {r.status_code}")
+    except Exception as e:
+        print(f"Discord image error: {e}")
+
+# ---------- CRYPTOCOMPARE HELPERS ----------
+CC_API_KEY = os.environ.get("CRYPTOCOMPARE_API_KEY", "").strip()
+CC_BASE = "https://min-api.cryptocompare.com"
+
+def split_pair(sym: str):
+    base, quote = sym.split("-")
+    return base, quote
+
+def days_since(start_str: str) -> int:
+    start = datetime.strptime(start_str, "%Y-%m-%d").date()
+    return (date.today() - start).days
+
+def cc_histoday(fsym: str, tsym: str, to_ts: int, limit: int) -> pd.DataFrame:
+    url = f"{CC_BASE}/data/v2/histoday"
+    headers = {"User-Agent": "cc-client/1.0"}
+    if CC_API_KEY:
+        headers["authorization"] = f"Apikey {CC_API_KEY}"
+    params = {"fsym": fsym, "tsym": tsym, "toTs": to_ts, "limit": limit}
+    r = requests.get(url, params=params, headers=headers, timeout=30)
+    r.raise_for_status()
+    js = r.json()
+    if js.get("Response") != "Success":
+        msg = js.get("Message", "Unknown error")
+        raise RuntimeError(f"CryptoCompare error: {msg}")
+    df = pd.DataFrame(js["Data"]["Data"])
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.date
+    df = df.rename(columns={"open":"open","high":"high","low":"low","close":"close"})
+    return df[["date","open","high","low","close"]]
+
+def download_cc_ticker(sym: str, start_str: str) -> pd.DataFrame:
+    fsym, tsym = split_pair(sym)
+    total = days_since(start_str) + 3
+    to_ts = int(datetime.now(timezone.utc).timestamp())
+    chunks = []
+    remain = total
+    while remain > 0:
+        lim = min(2000, remain)
+        backoff = 1.0
+        for _ in range(5):
+            try:
+                df = cc_histoday(fsym, tsym, to_ts, lim)
+                if not df.empty:
+                    chunks.append(df)
+                break
+            except Exception:
+                time.sleep(backoff + random.uniform(0, 0.25))
+                backoff = min(backoff * 2, 8)
+        to_ts -= lim * 86400
+        remain -= lim
+        time.sleep(0.05 + random.uniform(0, 0.1))
+    if not chunks:
+        return pd.DataFrame()
+    all_df = pd.concat(chunks, ignore_index=True).drop_duplicates("date").sort_values("date")
+    start_d = datetime.strptime(start_str, "%Y-%m-%d").date()
+    all_df = all_df[all_df["date"] >= start_d]
+    all_df.index = pd.to_datetime(all_df["date"])
+    return all_df.drop(columns=["date"])
+
+def download_all_cc(tickers):
+    print("Downloading daily OHLC from CryptoCompare…")
+    results = {}
+    for i, t in enumerate(tickers, 1):
+        try:
+            df = download_cc_ticker(t, START_DATE)
+            if df.empty:
+                print(f"[{t}] empty from CC; skipping.")
+            else:
+                results[t] = df
+                print(f"[{t}] rows: {len(df)}")
+        except Exception as e:
+            print(f"[{t}] failed: {e}")
+    if not results:
+        raise RuntimeError("All downloads failed from CryptoCompare.")
+    return results
+
+# ---------- DATA ----------
+raw_dict = download_all_cc(TICKERS)
+
+common_index = pd.date_range(START_DATE, date.today(), freq="D")
+frames = []
+for t, df in raw_dict.items():
+    d = pd.DataFrame(index=common_index)
+    d["close"] = df["close"].reindex(common_index, method="ffill")
+    d["high"]  = df["high"].reindex(common_index, method="ffill")
+    d["low"]   = df["low"].reindex(common_index, method="ffill")
+    d["ticker"] = t
+    frames.append(d)
+
+merged = pd.concat(frames)
+close = merged.pivot(columns="ticker", values="close")
+high  = merged.pivot(columns="ticker", values="high")
+low   = merged.pivot(columns="ticker", values="low")
+rets  = close.pct_change().fillna(0)
+btc_curve = (1 + rets.get("BTC-USD", pd.Series(0, index=rets.index))).cumprod()
+
+print(f"Data rows: close={len(close)}, rets={len(rets)}")
+print(f"Date range: {close.index.min()} → {close.index.max()}")
+
+# ---------- INDICATORS ----------
+print("Calculating RSI + SuperTrend…")
+rsi_df = pd.DataFrame(index=close.index, columns=close.columns)
+trend_state = pd.DataFrame(False, index=close.index, columns=close.columns)
+
+for t in close.columns:
+    try:
+        c, h, l = close[t], high[t], low[t]
+        rsi = RSIIndicator(c, window=RSI_WIN).rsi()
+        atr = (h - l).rolling(ATR_WIN).mean()
+        hl2 = (h + l) / 2
+        ema = EMAIndicator(hl2, window=ATR_WIN).ema_indicator()
+        upper = ema + ATR_MULT * atr
+        lower = ema - ATR_MULT * atr
+
+        st = pd.Series(index=c.index, dtype=float)
+        direction = 1
+        for i in range(1, len(c)):
+            prev_dir = direction
+            if prev_dir == 1 and c.iloc[i] < lower.iloc[i-1]:
+                direction = -1
+            elif prev_dir == -1 and c.iloc[i] > upper.iloc[i-1]:
+                direction = 1
+            st.iloc[i] = upper.iloc[i] if direction == -1 else lower.iloc[i]
+        trend_state[t] = (c > st).astype(int)
+        rsi_df[t] = rsi
+    except Exception as e:
+        print(f"⚠️ Skipping {t} due to error: {e}")
+
+sma50 = close.rolling(50).mean()
+breadth = (close > sma50).mean(axis=1)
+exposure = breadth.clip(0.3, 0.7).ewm(span=5, min_periods=3).mean()
+
+def inv_sqrt_vol(vol: pd.Series) -> pd.Series:
+    w = 1 / np.sqrt(vol + 1e-9)
+    w[~np.isfinite(w)] = 0
+    s = w.sum()
+    return (w / s) if s > 0 else (w * 0)
+
+# ---------- BACKTEST (with fees) ----------
+print("Running backtest…")
+equity = pd.Series(1.0, index=close.index)
+weights = pd.DataFrame(0.0, index=close.index, columns=close.columns)
+
+for i, d in enumerate(close.index):
+    if i == 0:
+        continue
+    exp_today = float(exposure.loc[d])
+    rsi = rsi_df.loc[d].dropna()
+    trend = trend_state.loc[d].dropna()
+    valid = [t for t in rsi.index if (rsi[t] > RSI_THRESH) and (trend[t] == 1)]
+    if len(valid) == 0:
+        weights.loc[d] = 0
+        equity.iloc[i] = equity.iloc[i-1]
+        continue
+
+    score = rsi[valid]
+    top = score.sort_values(ascending=False).head(TOP_N)
+    vol30 = rets[valid].rolling(VOL_WIN).std().loc[d]
+    vol30 = vol30.reindex(top.index).fillna(vol30.median())
+    w_iv = inv_sqrt_vol(vol30)
+    comb = top * w_iv
+    w_core = comb / comb.sum()
+
+    w = pd.Series(0.0, index=close.columns)
+    w[w_core.index] = w_core.values * exp_today
+
+    peak = equity.iloc[:i].max()
+    dd = equity.iloc[i-1] / peak - 1 if peak > 0 else 0
+    if dd <= -DD_TRIGGER:
+        w *= 0.5
+
+    prev_w = weights.iloc[i-1]
+    turnover = np.abs(w - prev_w).sum() / 2.0
+    fee = turnover * FEE_RATE
+
+    weights.loc[d] = w
+    daily_ret = (prev_w * rets.iloc[i]).sum()
+    equity.iloc[i] = equity.iloc[i-1] * (1 + daily_ret - fee)
+
+# ---------- METRICS (with Sortino fixed) ----------
+port_rets = equity.pct_change().fillna(0)
+mu = port_rets.mean()
+sigma = port_rets.std() + 1e-12
+downside = port_rets[port_rets < 0].std() + 1e-12
+
+sharpe = (mu / sigma) * np.sqrt(365)
+sortino = (mu / downside) * np.sqrt(365)
+drawdown = equity / equity.cummax() - 1
+max_dd = drawdown.min() * 100
+total_ret = (equity.iloc[-1] - 1) * 100
+
+last_w = weights.iloc[-1]
+sel = last_w[last_w > 0].sort_values(ascending=False)
+
+# ---------- PLOT (only Equity vs BTC + Drawdown) ----------
+fig, axs = plt.subplots(2, 1, figsize=(12, 8), sharex=True, gridspec_kw={"height_ratios": [3, 1]})
+axs[0].plot(equity.index, equity.values, label="Strategy (with fees)", lw=2)
+axs[0].plot((1 + rets.get("BTC-USD", pd.Series(0, index=rets.index))).cumprod().index,
+            (1 + rets.get("BTC-USD", pd.Series(0, index=rets.index))).cumprod().values,
+            label="BTC Buy & Hold", ls="--", alpha=0.8)
+axs[0].legend(); axs[0].grid(True, ls="--", alpha=0.5)
+axs[0].set_title("RSI + SuperTrend | Top-3 (Daily) — Equity vs BTC")
+
+axs[1].fill_between(drawdown.index, drawdown.values, 0, color="red", alpha=0.3)
+axs[1].set_ylabel("Drawdown")
+axs[1].grid(True, ls="--", alpha=0.5)
+plt.tight_layout()
+
+out_png = os.path.join(os.getcwd(), "rsi_supertrend_backtest.png")
+plt.savefig(out_png, dpi=150, bbox_inches="tight")
+plt.close()
+print(f"✅ Chart saved: {out_png}")
+
+# ---------- DISCORD POST ----------
+today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+lines = [
+    f"📊 **RSI+SuperTrend Daily Update** ({today})",
+    f"Total Return (since {START_DATE}): {total_ret:.2f}%",
+    f"Sharpe: {sharpe:.2f}",
+    f"Sortino: {sortino:.2f}",
+    f"Max DD: {max_dd:.2f}%",
+    "",
+    "Current Top Holdings:" if not sel.empty else "No active positions today."
+]
+if not sel.empty:
+    for t, w in sel.head(TOP_N).items():
+        lines.append(f"• {t}: {w*100:.1f}%")
+message = "\n".join(lines)
+
+send_discord_image("RSI+SuperTrend — Equity Curve (with fees)", out_png)
+send_discord_text(message)
+
+# ---------- CONSOLE SUMMARY ----------
+print("\n=== Current Top Holdings ===")
+if sel.empty:
+    print("Cash only (no active RSI+SuperTrend uptrends).")
+else:
+    for t,w in sel.head(TOP_N).items():
+        print(f"{t}: {w*100:.1f}%")
+
+
+
+
+
+
