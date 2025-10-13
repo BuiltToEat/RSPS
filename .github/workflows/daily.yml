@@ -2,24 +2,35 @@ name: Daily RSI-SuperTrend (Discord)
 
 on:
   schedule:
-    - cron: "5 0 * * *"   # 00:05 UTC  (11:05 Sydney during AEDT)
-    - cron: "5 1 * * *"   # 01:05 UTC  (11:05 Sydney during AEST)
+    # Triggers at 00:05 and 01:05 UTC daily.
+    # The gate below ensures only the one where Sydney local time is 11:05 proceeds.
+    - cron: "5 0,1 * * *"
   workflow_dispatch:
+
+concurrency:
+  group: rsi-supertrend-daily
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TZ: Australia/Sydney
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      # Gate: only proceed when it's 11:05 in Sydney right now
       - name: Gate by Sydney local time
         id: gate
+        shell: bash
         run: |
           echo "UTC now: $(date -u)"
           TZ=Australia/Sydney date "+Sydney now: %Y-%m-%d %H:%M:%S %Z"
-          SYD_TIME=$(TZ=Australia/Sydney date +%H:%M)
-          echo "Sydney clock (HH:MM): $SYD_TIME"
-
-          if [ "$SYD_TIME" = "11:05" ]; then
+          SYD_HM=$(TZ=Australia/Sydney date +%H:%M)
+          echo "Sydney clock (HH:MM): $SYD_HM"
+          if [ "$SYD_HM" = "11:05" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "Decision: proceed (it's 11:05 in Sydney)."
           else
@@ -36,6 +47,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Upgrade pip
         if: steps.gate.outputs.run == 'true'
@@ -47,16 +59,43 @@ jobs:
           pip install "numpy==1.26.4" "pandas==2.2.2" "matplotlib==3.9.2" \
                       "ta==0.11.0" "requests>=2.31"
 
-      - name: Run script (filename has spaces!)
+      - name: Run strategy script
         if: steps.gate.outputs.run == 'true'
+        # Runs the file named exactly: RSPS THE OG   (no .py extension)
         run: python "RSPS THE OG"
 
-      - name: Upload chart image
+      - name: Upload chart image (artifact)
         if: steps.gate.outputs.run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: equity-curve
           path: rsi_supertrend_backtest.png
+
+      - name: Post results to Discord (hardcoded webhook)
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        env:
+          HOOK: "https://canary.discord.com/api/webhooks/1425769640876965990/rJb62mNKfI5aKUeUxNHkPjZ424c3gd3qaWo6IFeY5Y1RwI_Fu_yyWqn33OY6vHm69efE"
+        run: |
+          if [ -z "$HOOK" ]; then
+            echo "No webhook set; skipping Discord notify."
+            exit 0
+          fi
+
+          RUN_TS="$(TZ=Australia/Sydney date '+%Y-%m-%d %H:%M %Z')"
+          MSG="✅ RSI-SuperTrend run finished at ${RUN_TS}"
+
+          if [ -f "rsi_supertrend_backtest.png" ]; then
+            curl -sS -X POST \
+              -F "payload_json={\"content\":\"${MSG}\",\"allowed_mentions\":{\"parse\":[]}}" \
+              -F "file1=@rsi_supertrend_backtest.png" \
+              "$HOOK"
+          else
+            curl -sS -H "Content-Type: application/json" -X POST \
+              -d "{\"content\":\"${MSG} (chart not found)\",\"allowed_mentions\":{\"parse\":[]}}" \
+              "$HOOK"
+          fi
+
 
 
 
