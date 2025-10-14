@@ -2,10 +2,16 @@ name: Daily RSI-SuperTrend (Discord)
 
 on:
   schedule:
-    # Triggers at 00:05 and 01:05 UTC daily.
-    # The gate below ensures only the one where Sydney local time is 11:05 proceeds.
-    - cron: "5 0,1 * * *"
+    # AEDT (UTC+11): 00:05 UTC == 11:05 Sydney
+    - cron: "5 0 * * *"
+    # AEST (UTC+10): 01:05 UTC == 11:05 Sydney
+    - cron: "5 1 * * *"
   workflow_dispatch:
+    inputs:
+      run_anyway:
+        description: "Bypass the Sydney-time gate and run now (for testing)"
+        type: boolean
+        default: false
 
 concurrency:
   group: rsi-supertrend-daily
@@ -19,23 +25,41 @@ env:
 
 jobs:
   run:
+    # Only scheduled runs proceed by default; manual needs explicit override.
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_anyway == true)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Gate by Sydney local time
+      - name: Show trigger info
+        shell: bash
+        run: |
+          echo "Event: ${{ github.event_name }}"
+          echo "Cron:  ${{ github.event.schedule || 'n/a' }}"
+          echo "UTC now: $(date -u)"
+          TZ=Australia/Sydney date "+Sydney now: %Y-%m-%d %H:%M:%S %Z"
+
+      - name: Gate by Sydney local time (11:05–11:14 window)
         id: gate
         shell: bash
         run: |
-          echo "UTC now: $(date -u)"
-          TZ=Australia/Sydney date "+Sydney now: %Y-%m-%d %H:%M:%S %Z"
-          SYD_HM=$(TZ=Australia/Sydney date +%H:%M)
-          echo "Sydney clock (HH:MM): $SYD_HM"
-          if [ "$SYD_HM" = "11:05" ]; then
+          SYD_H=$(TZ=Australia/Sydney date +%H)
+          SYD_M=$(TZ=Australia/Sydney date +%M)
+          echo "Sydney clock H=$SYD_H M=$SYD_M"
+
+          # Manual override for testing
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.run_anyway }}" = "true" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "Decision: proceed (it's 11:05 in Sydney)."
+            echo "Decision: proceed (manual override)."
+            exit 0
+          fi
+
+          # Allow 10-minute jitter window: 11:05–11:14 inclusive
+          if [ "$SYD_H" = "11" ] && [ "$SYD_M" -ge 5 ] && [ "$SYD_M" -le 14 ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Decision: proceed (within 11:05–11:14 Sydney window)."
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "Decision: skip (not 11:05 in Sydney)."
+            echo "Decision: skip (outside 11:05–11:14 Sydney window)."
           fi
 
       - name: Check out repo
@@ -61,7 +85,7 @@ jobs:
 
       - name: Run strategy script
         if: steps.gate.outputs.run == 'true'
-        # Runs the file named exactly: RSPS THE OG   (no .py extension)
+        # Your script name exactly (no .py extension)
         run: python "RSPS THE OG"
 
       - name: Upload chart image (artifact)
@@ -77,11 +101,6 @@ jobs:
         env:
           HOOK: "https://canary.discord.com/api/webhooks/1425769640876965990/rJb62mNKfI5aKUeUxNHkPjZ424c3gd3qaWo6IFeY5Y1RwI_Fu_yyWqn33OY6vHm69efE"
         run: |
-          if [ -z "$HOOK" ]; then
-            echo "No webhook set; skipping Discord notify."
-            exit 0
-          fi
-
           RUN_TS="$(TZ=Australia/Sydney date '+%Y-%m-%d %H:%M %Z')"
           MSG="✅ RSI-SuperTrend run finished at ${RUN_TS}"
 
@@ -95,6 +114,7 @@ jobs:
               -d "{\"content\":\"${MSG} (chart not found)\",\"allowed_mentions\":{\"parse\":[]}}" \
               "$HOOK"
           fi
+
 
 
 
