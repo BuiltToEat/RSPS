@@ -25,7 +25,7 @@ env:
 
 jobs:
   run:
-    # Only scheduled runs proceed by default; manual needs explicit override.
+    # Only scheduled runs proceed; manual runs require the explicit override.
     if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_anyway == true)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -46,14 +46,14 @@ jobs:
           SYD_M=$(TZ=Australia/Sydney date +%M)
           echo "Sydney clock H=$SYD_H M=$SYD_M"
 
-          # Manual override for testing
+          # Allow manual override ONLY if run_anyway=true
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.run_anyway }}" = "true" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "Decision: proceed (manual override)."
             exit 0
           fi
 
-          # Allow 10-minute jitter window: 11:05–11:14 inclusive
+          # 10-minute jitter window so slight cron delays still run
           if [ "$SYD_H" = "11" ] && [ "$SYD_M" -ge 5 ] && [ "$SYD_M" -le 14 ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "Decision: proceed (within 11:05–11:14 Sydney window)."
@@ -66,12 +66,22 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Verify script is present
+        if: steps.gate.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Listing repo root:"
+          ls -la
+          test -f "RSPS THE OG" || { echo "ERROR: 'RSPS THE OG' not found at repo root"; exit 1; }
+
+      - name: Set up Python (pip cache via requirements.txt)
         if: steps.gate.outputs.run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
+          cache-dependency-path: "requirements.txt"
 
       - name: Upgrade pip
         if: steps.gate.outputs.run == 'true'
@@ -79,21 +89,19 @@ jobs:
 
       - name: Install dependencies
         if: steps.gate.outputs.run == 'true'
-        run: |
-          pip install "numpy==1.26.4" "pandas==2.2.2" "matplotlib==3.9.2" \
-                      "ta==0.11.0" "requests>=2.31"
+        run: pip install -r requirements.txt
 
       - name: Run strategy script
         if: steps.gate.outputs.run == 'true'
-        # Your script name exactly (no .py extension)
         run: python "RSPS THE OG"
 
       - name: Upload chart image (artifact)
-        if: steps.gate.outputs.run == 'true'
+        if: steps.gate.outputs.run == 'true' && always()
         uses: actions/upload-artifact@v4
         with:
           name: equity-curve
           path: rsi_supertrend_backtest.png
+          if-no-files-found: warn
 
       - name: Post results to Discord (hardcoded webhook)
         if: steps.gate.outputs.run == 'true'
@@ -101,6 +109,7 @@ jobs:
         env:
           HOOK: "https://canary.discord.com/api/webhooks/1425769640876965990/rJb62mNKfI5aKUeUxNHkPjZ424c3gd3qaWo6IFeY5Y1RwI_Fu_yyWqn33OY6vHm69efE"
         run: |
+          set -euo pipefail
           RUN_TS="$(TZ=Australia/Sydney date '+%Y-%m-%d %H:%M %Z')"
           MSG="✅ RSI-SuperTrend run finished at ${RUN_TS}"
 
@@ -114,6 +123,7 @@ jobs:
               -d "{\"content\":\"${MSG} (chart not found)\",\"allowed_mentions\":{\"parse\":[]}}" \
               "$HOOK"
           fi
+
 
 
 
