@@ -38,7 +38,7 @@ jobs:
           echo "UTC now: $(date -u)"
           TZ=Australia/Sydney date "+Sydney now: %Y-%m-%d %H:%M:%S %Z"
 
-      - name: Gate by Sydney local time (11:05–11:14 window)
+      - name: Gate by Sydney local time (11:05–12:05 window)
         id: gate
         shell: bash
         run: |
@@ -53,13 +53,16 @@ jobs:
             exit 0
           fi
 
-          # 10-minute jitter window so slight cron delays still run
-          if [ "$SYD_H" = "11" ] && [ "$SYD_M" -ge 5 ] && [ "$SYD_M" -le 14 ]; then
+          # 1-hour jitter window so slight cron delays still run
+          if [ "$SYD_H" = "11" ] && [ "$SYD_M" -ge 5 ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "Decision: proceed (within 11:05–11:14 Sydney window)."
+            echo "Decision: proceed (within 11:05–12:05 Sydney window)."
+          elif [ "$SYD_H" = "12" ] && [ "$SYD_M" -le 5 ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Decision: proceed (within 11:05–12:05 Sydney window)."
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "Decision: skip (outside 11:05–11:14 Sydney window)."
+            echo "Decision: skip (outside 11:05–12:05 Sydney window)."
           fi
 
       - name: Check out repo
