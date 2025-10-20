@@ -33,8 +33,8 @@ jobs:
           else
             pip install numpy pandas requests matplotlib
           fi
-          pip install "jinja2>=3.1,<4" playwright
-          python -m playwright install --with-deps chromium
+          # Needed by pandas Styler (HTML)
+          pip install "jinja2>=3.1,<4"
 
       - name: Run screener (ALT LEAGUE, no extension)
         run: |
@@ -48,34 +48,26 @@ jobs:
           cp -f meme_screener_daily.html out/ || true
           cp -f meme_screener_daily.csv  out/ || true
           cp -f meme_rsps_backtest.png   out/ || true
+          # If your script used different names, grab them too:
+          shopt -s nullglob
+          for f in *backtest*.png; do cp -f "$f" out/; done
           echo "Root files:"; ls -lah
           echo "out files:"; ls -lah out
 
-      - name: Screenshot table (Playwright → out/table.png)
+      # --- Make a PNG of the HTML table (no Python, just wkhtmltoimage) ---
+      - name: Install wkhtmltoimage
         run: |
-          if [ ! -f out/meme_screener_daily.html ]; then
-            echo "No HTML to screenshot"; exit 0; fi
-          python - <<'PY'
-from pathlib import Path
-from playwright.sync_api import sync_playwright
+          sudo apt-get update
+          sudo apt-get install -y wkhtmltopdf
+          wkhtmltoimage --version || true
 
-html = Path("out/meme_screener_daily.html").resolve().as_uri()
-out_png = "out/table.png"
-
-with sync_playwright() as p:
-    browser = p.chromium.launch()
-    ctx = browser.new_context(viewport={"width":1600, "height":1200}, device_scale_factor=1)
-    page = ctx.new_page()
-    page.goto(html, wait_until="load")
-    try:
-        page.locator("table").first.screenshot(path=out_png, animations="disabled", timeout=8000)
-    except Exception:
-        page.screenshot(path=out_png, full_page=True, animations="disabled")
-    browser.close()
-
-print("Saved", out_png)
-PY
-          ls -lah out
+      - name: Screenshot table → out/table.png
+        run: |
+          if [ -f out/meme_screener_daily.html ]; then
+            wkhtmltoimage --width 1800 --quality 95 \
+              out/meme_screener_daily.html out/table.png || true
+          fi
+          ls -lah out || true
 
       - name: Normalize backtest name (→ out/backtest.png)
         run: |
@@ -84,18 +76,24 @@ PY
           elif ls out/*backtest*.png 1>/dev/null 2>&1; then
             mv -f "$(ls out/*backtest*.png | head -n1)" out/backtest.png
           fi
-          ls -lah out
+          ls -lah out || true
 
-      - name: Post to Discord (2 screenshots + csv if exists)
+      - name: Post to Discord (exactly 2 screenshots + csv if exists)
         run: |
           SYD_DATE="$(date +%Y-%m-%d)"
-          # Base message (so you always see something)
+          # Base message so you always see something
           curl -sS -H "Content-Type: application/json" \
                -X POST "$DISCORD_WEBHOOK_URL" \
                -d "{\"content\":\"Meme Screener — ${SYD_DATE}\\nTable + equity curve.\"}" >/dev/null
 
+          # If table.png didn't render, attach the HTML instead so you still see the table
           declare -a args
-          [ -f out/table.png ]    && args+=(-F "file1=@out/table.png;type=image/png;filename=table-${SYD_DATE}.png")
+          if [ -f out/table.png ]; then
+            args+=(-F "file1=@out/table.png;type=image/png;filename=table-${SYD_DATE}.png")
+          elif [ -f out/meme_screener_daily.html ]; then
+            args+=(-F "file1=@out/meme_screener_daily.html;type=text/html;filename=table-${SYD_DATE}.html")
+          fi
+
           [ -f out/backtest.png ] && args+=(-F "file2=@out/backtest.png;type=image/png;filename=backtest-${SYD_DATE}.png")
           [ -f out/meme_screener_daily.csv ] && args+=(-F "file3=@out/meme_screener_daily.csv;type=text/csv;filename=screener-${SYD_DATE}.csv")
 
@@ -103,8 +101,6 @@ PY
             curl -sS -X POST "$DISCORD_WEBHOOK_URL" \
                  -F "payload_json={\"content\":\"Attachments for ${SYD_DATE}\"}" \
                  "${args[@]}" >/dev/null
-          else
-            echo "No attachments found; only sent base message."
           fi
 
       - name: Upload artifacts (optional)
@@ -112,6 +108,7 @@ PY
         with:
           name: meme-screener-${{ github.run_id }}
           path: out/
+
 
 
 
