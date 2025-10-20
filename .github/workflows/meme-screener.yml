@@ -2,20 +2,19 @@ name: Meme Screener Daily (UTC Close)
 
 on:
   schedule:
-    - cron: "0 0 * * *"   # 00:00 UTC daily
-  workflow_dispatch: {}
+    - cron: "0 0 * * *"           # 00:00 UTC daily (UTC close)
+  workflow_dispatch: {}           # Manual "Run workflow" button
 
 jobs:
   run-screener:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      MPLBACKEND: Agg
       TZ: Australia/Sydney
-      # Hard-wire your exact webhook URL (no secret fallback to avoid surprises)
-      DISCORD_WEBHOOK_URL: https://canary.discord.com/api/webhooks/1429701285975949322/fS0y9EkVQtnP15CJkAQEHEdpgL5Hlk43-Ct4D9uyZjjJT2jbk9nPkETT5cbbGGDyPVqD
-      # Your CryptoCompare key (inline or move to a secret if you prefer)
+      MPLBACKEND: Agg
+      # Hard-wired secrets per your request (you can move to repo Secrets later)
       CRYPTOCOMPARE_API_KEY: d5ddb7a7f49de4d4a8af07e98e0ebf437e7acc8bb282f12af978320486f741e7
+      DISCORD_WEBHOOK_URL: https://discord.com/api/webhooks/1429701285975949322/fS0y9EkVQtnP15CJkAQEHEdpgL5Hlk43-Ct4D9uyZjjJT2jbk9nPkETT5cbbGGDyPVqD
 
     steps:
       - name: Checkout
@@ -26,7 +25,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Python deps
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
@@ -34,7 +33,7 @@ jobs:
           else
             pip install numpy pandas requests matplotlib
           fi
-          # Pandas Styler needs jinja2
+          # Ensure pandas Styler dependency
           pip install "jinja2>=3.1,<4"
 
       - name: Run screener (ALT LEAGUE, no extension)
@@ -42,25 +41,23 @@ jobs:
           echo "Sydney date/time: $(date)"
           python "ALT LEAGUE"
 
-      - name: Prepare outputs
+      - name: Collect outputs
         run: |
           mkdir -p out
           cp meme_screener_daily.html out/ || true
           cp meme_screener_daily.csv  out/ || true
           cp meme_rsps_backtest.png   out/ || true
 
-      # --- Convert HTML table to PNG screenshot (headless, fast) ---
+      # Convert the HTML table to a PNG snapshot
       - name: Install wkhtmltoimage
         run: |
           sudo apt-get update
           sudo apt-get install -y wkhtmltopdf
-          # wkhtmltopdf package includes wkhtmltoimage on Ubuntu
           wkhtmltoimage --version
 
       - name: Make table screenshot
         run: |
           if [ -f out/meme_screener_daily.html ]; then
-            # Wider viewport so the table fits nicely
             wkhtmltoimage --width 1600 --quality 92 \
               out/meme_screener_daily.html out/meme_screener_daily_table.png
           fi
@@ -71,16 +68,48 @@ jobs:
           name: meme-screener-${{ github.run_id }}
           path: out/
 
-      - name: Notify Discord (images + csv)
+      # Verbose, fail-safe Discord post (base message + attachments, with HTTP codes)
+      - name: Notify Discord (verbose, fail-safe)
         env:
           DISCORD_WEBHOOK_URL: ${{ env.DISCORD_WEBHOOK_URL }}
         run: |
+          set -euo pipefail
           SYD_DATE="$(date +%Y-%m-%d)"
+
+          echo "DEBUG: listing out/ ..."
+          ls -lah out || true
+
           SUMMARY="Meme Screener — ${SYD_DATE}\nBacktest and table snapshot."
-          args=(-F "payload_json={\"content\":\"${SUMMARY}\"}")
-          # Attach table PNG first (preview), then backtest chart, then CSV
-          [ -f out/meme_screener_daily_table.png ] && args+=(-F "file1=@out/meme_screener_daily_table.png;type=image/png;filename=table-${SYD_DATE}.png")
-          [ -f out/meme_rsps_backtest.png ]        && args+=(-F "file2=@out/meme_rsps_backtest.png;type=image/png;filename=backtest-${SYD_DATE}.png")
-          [ -f out/meme_screener_daily.csv ]       && args+=(-F "file3=@out/meme_screener_daily.csv;type=text/csv;filename=screener-${SYD_DATE}.csv")
-          curl -sS -X POST "$DISCORD_WEBHOOK_URL" "${args[@]}"
+          echo "DEBUG: Sending base message to Discord..."
+          curl -sS -o /tmp/resp1.txt -w "HTTP:%{http_code}\n" \
+            -H "Content-Type: application/json" \
+            -X POST "$DISCORD_WEBHOOK_URL" \
+            -d "{\"content\":\"${SUMMARY}\"}"
+          echo "DEBUG: Base response:"; cat /tmp/resp1.txt || true
+
+          declare -a args
+          if [ -f out/meme_screener_daily_table.png ]; then
+            echo "DEBUG: Attaching table PNG"
+            args+=(-F "file1=@out/meme_screener_daily_table.png;type=image/png;filename=table-${SYD_DATE}.png")
+          fi
+          if [ -f out/meme_rsps_backtest.png ]; then
+            echo "DEBUG: Attaching backtest PNG"
+            args+=(-F "file2=@out/meme_rsps_backtest.png;type=image/png;filename=backtest-${SYD_DATE}.png")
+          fi
+          if [ -f out/meme_screener_daily.csv ]; then
+            echo "DEBUG: Attaching CSV"
+            args+=(-F "file3=@out/meme_screener_daily.csv;type=text/csv;filename=screener-${SYD_DATE}.csv")
+          fi
+
+          if [ ${#args[@]} -gt 0 ]; then
+            echo "DEBUG: Posting attachments..."
+            curl -sS -o /tmp/resp2.txt -w "HTTP:%{http_code}\n" \
+              -X POST "$DISCORD_WEBHOOK_URL" \
+              -F "payload_json={\"content\":\"Attachments for ${SYD_DATE}\"}" \
+              "${args[@]}"
+            echo "DEBUG: Attachment response:"; cat /tmp/resp2.txt || true
+          else
+            echo "DEBUG: No attachments found in out/"
+          fi
+
 
