@@ -2,9 +2,8 @@ name: Meme Screener Daily (UTC Close)
 
 on:
   schedule:
-    # 00:00 UTC every day (UTC close). ~11:00 AM Sydney during AEDT, ~10:00 AM during AEST.
-    - cron: "0 0 * * *"
-  workflow_dispatch: {}   # Manual "Run workflow" button
+    - cron: "0 0 * * *"   # 00:00 UTC daily
+  workflow_dispatch: {}
 
 jobs:
   run-screener:
@@ -13,14 +12,10 @@ jobs:
     env:
       MPLBACKEND: Agg
       TZ: Australia/Sydney
-
-      # --- RECOMMENDED: keep secrets in repo Settings → Secrets and variables → Actions ---
-      # CRYPTOCOMPARE_API_KEY: ${{ secrets.CRYPTOCOMPARE_API_KEY }}
-      # DISCORD_WEBHOOK_URL:  ${{ secrets.DISCORD_WEBHOOK_URL }}
-
-      # --- Inline (only if you insist; not recommended) ---
-      # CRYPTOCOMPARE_API_KEY: d5ddb7a7f49de4d4a8af07e98e0ebf437e7acc8bb282f12af978320486f741e7
-      # DISCORD_WEBHOOK_URL:  https://canary.discord.com/api/webhooks/1429701285975949322/fS0y9EkVQtnP15CJkAQEHEdpgL5Hlk43-Ct4D9uyZjjJT2jbk9nPkETT5cbbGGDyPVqD
+      # Hard-wire your exact webhook URL (no secret fallback to avoid surprises)
+      DISCORD_WEBHOOK_URL: https://canary.discord.com/api/webhooks/1429701285975949322/fS0y9EkVQtnP15CJkAQEHEdpgL5Hlk43-Ct4D9uyZjjJT2jbk9nPkETT5cbbGGDyPVqD
+      # Your CryptoCompare key (inline or move to a secret if you prefer)
+      CRYPTOCOMPARE_API_KEY: d5ddb7a7f49de4d4a8af07e98e0ebf437e7acc8bb282f12af978320486f741e7
 
     steps:
       - name: Checkout
@@ -31,7 +26,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install Python deps
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
@@ -39,20 +34,36 @@ jobs:
           else
             pip install numpy pandas requests matplotlib
           fi
+          # Pandas Styler needs jinja2
+          pip install "jinja2>=3.1,<4"
 
-      - name: Run screener (ALT LEAGUE with no extension)
-        env:
-          CRYPTOCOMPARE_API_KEY: ${{ env.CRYPTOCOMPARE_API_KEY || secrets.CRYPTOCOMPARE_API_KEY }}
+      - name: Run screener (ALT LEAGUE, no extension)
         run: |
           echo "Sydney date/time: $(date)"
-          python "ALT LEAGUE"   # <- no .py, quoted for the space
+          python "ALT LEAGUE"
 
-      - name: Collect outputs
+      - name: Prepare outputs
         run: |
           mkdir -p out
           cp meme_screener_daily.html out/ || true
           cp meme_screener_daily.csv  out/ || true
           cp meme_rsps_backtest.png   out/ || true
+
+      # --- Convert HTML table to PNG screenshot (headless, fast) ---
+      - name: Install wkhtmltoimage
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wkhtmltopdf
+          # wkhtmltopdf package includes wkhtmltoimage on Ubuntu
+          wkhtmltoimage --version
+
+      - name: Make table screenshot
+        run: |
+          if [ -f out/meme_screener_daily.html ]; then
+            # Wider viewport so the table fits nicely
+            wkhtmltoimage --width 1600 --quality 92 \
+              out/meme_screener_daily.html out/meme_screener_daily_table.png
+          fi
 
       - name: Upload artifacts (optional)
         uses: actions/upload-artifact@v4
@@ -60,14 +71,16 @@ jobs:
           name: meme-screener-${{ github.run_id }}
           path: out/
 
-      - name: Notify Discord
+      - name: Notify Discord (images + csv)
         env:
-          DISCORD_WEBHOOK_URL: ${{ env.DISCORD_WEBHOOK_URL || secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_WEBHOOK_URL: ${{ env.DISCORD_WEBHOOK_URL }}
         run: |
           SYD_DATE="$(date +%Y-%m-%d)"
-          SUMMARY="Meme Screener — ${SYD_DATE}\nTop coins & risk metrics with log-scale backtest vs BTC."
+          SUMMARY="Meme Screener — ${SYD_DATE}\nBacktest and table snapshot."
           args=(-F "payload_json={\"content\":\"${SUMMARY}\"}")
-          [ -f out/meme_screener_daily.html ] && args+=(-F "file1=@out/meme_screener_daily.html;type=text/html;filename=screener-${SYD_DATE}.html")
-          [ -f out/meme_screener_daily.csv ]  && args+=(-F "file2=@out/meme_screener_daily.csv;type=text/csv;filename=screener-${SYD_DATE}.csv")
-          [ -f out/meme_rsps_backtest.png ]   && args+=(-F "file3=@out/meme_rsps_backtest.png;type=image/png;filename=backtest-${SYD_DATE}.png")
+          # Attach table PNG first (preview), then backtest chart, then CSV
+          [ -f out/meme_screener_daily_table.png ] && args+=(-F "file1=@out/meme_screener_daily_table.png;type=image/png;filename=table-${SYD_DATE}.png")
+          [ -f out/meme_rsps_backtest.png ]        && args+=(-F "file2=@out/meme_rsps_backtest.png;type=image/png;filename=backtest-${SYD_DATE}.png")
+          [ -f out/meme_screener_daily.csv ]       && args+=(-F "file3=@out/meme_screener_daily.csv;type=text/csv;filename=screener-${SYD_DATE}.csv")
           curl -sS -X POST "$DISCORD_WEBHOOK_URL" "${args[@]}"
+
