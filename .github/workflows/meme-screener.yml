@@ -1,18 +1,18 @@
-name: Meme Screener Daily (UTC Close)
+name: Meme Screener — 2 screenshots daily
 
 on:
   schedule:
-    - cron: "0 0 * * *"     # 00:00 UTC daily
-  workflow_dispatch: {}     # Manual Run
+    - cron: "0 0 * * *"        # 00:00 UTC every day (UTC close)
+  workflow_dispatch: {}        # manual Run workflow button
 
 jobs:
-  run-screener:
+  run:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
       TZ: Australia/Sydney
       MPLBACKEND: Agg
-      # Hard-wired per your request (switch to GitHub Secrets later if you want)
+      # Hard-wired creds per your request. (Move to repo secrets later if you want.)
       CRYPTOCOMPARE_API_KEY: d5ddb7a7f49de4d4a8af07e98e0ebf437e7acc8bb282f12af978320486f741e7
       DISCORD_WEBHOOK_URL: https://discord.com/api/webhooks/1429701285975949322/fS0y9EkVQtnP15CJkAQEHEdpgL5Hlk43-Ct4D9uyZjjJT2jbk9nPkETT5cbbGGDyPVqD
 
@@ -20,12 +20,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install Python deps
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then
@@ -33,61 +33,33 @@ jobs:
           else
             pip install numpy pandas requests matplotlib
           fi
+          # Needed for pandas Styler HTML
           pip install "jinja2>=3.1,<4"
-
-      - name: Run screener (ALT LEAGUE, no extension)
-        run: |
-          echo "Sydney date/time: $(date)"
-          python "ALT LEAGUE"
-
-      - name: Collect outputs (robust)
-        run: |
-          set -e
-          mkdir -p out
-          # Copy known names if present
-          cp -f meme_screener_daily.html out/ 2>/dev/null || true
-          cp -f meme_screener_daily.csv  out/ 2>/dev/null || true
-          cp -f meme_rsps_backtest.png   out/ 2>/dev/null || true
-          # Also copy ANY html/csv/png at repo root that looks relevant
-          shopt -s nullglob
-          for f in *.html *.csv *backtest*.png meme*/*.png; do
-            cp -f "$f" out/ || true
-          done
-          echo "DEBUG: files in repo root:"; ls -lah || true
-          echo "DEBUG: files in out/:"; ls -lah out || true
-
-      # ============ Table screenshot: fast path (wkhtmltoimage) ============
-      - name: Install wkhtmltoimage
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wkhtmltopdf
-          wkhtmltoimage --version || true
-
-      - name: Make table screenshot via wkhtmltoimage
-        run: |
-          set -e
-          if [ -f out/meme_screener_daily.html ]; then
-            echo "Trying wkhtmltoimage…"
-            wkhtmltoimage --width 1600 --quality 92 \
-              out/meme_screener_daily.html out/meme_screener_daily_table.png || true
-          fi
-          ls -lah out || true
-
-      # ============ Fallback screenshot: Playwright/Chromium ============
-      - name: Install Playwright (fallback)
-        run: |
+          # For HTML screenshot
           python -m pip install playwright
           python -m playwright install --with-deps chromium
 
-      - name: Make table screenshot via Playwright (fallback if needed)
+      - name: Run screener (ALT LEAGUE, no extension)
         run: |
-          set -e
-          if [ -f out/meme_screener_daily_table.png ]; then
-            echo "wkhtmltoimage succeeded; skipping Playwright fallback."
-            exit 0
-          fi
+          echo "Sydney: $(date)"
+          python "ALT LEAGUE"
+
+      - name: Gather outputs
+        run: |
+          set -euxo pipefail
+          mkdir -p out
+          # Known names (your script should already create these)
+          cp -f meme_screener_daily.html out/ || true
+          cp -f meme_screener_daily.csv  out/ || true
+          cp -f meme_rsps_backtest.png   out/ || true
+          echo "Repo root files:"; ls -lah
+          echo "out/ files:"; ls -lah out
+
+      - name: Screenshot table (Playwright)
+        run: |
+          set -euxo pipefail
           if [ ! -f out/meme_screener_daily.html ]; then
-            echo "No HTML found; cannot screenshot table."
+            echo "No HTML found – cannot screenshot the table."
             exit 0
           fi
           python - <<'PY'
@@ -95,79 +67,62 @@ import pathlib, asyncio
 from playwright.async_api import async_playwright
 
 html = pathlib.Path("out/meme_screener_daily.html").resolve().as_uri()
-png  = "out/meme_screener_daily_table.png"
+out_png = "out/table.png"
 
 async def main():
     async with async_playwright() as p:
         browser = await p.chromium.launch()
-        ctx = await browser.new_context(viewport={"width":1600,"height":1000}, device_scale_factor=1)
+        ctx = await browser.new_context(viewport={"width":1600,"height":1200}, device_scale_factor=1)
         page = await ctx.new_page()
         await page.goto(html, wait_until="load")
-        # Try to target the table; if not, snapshot full page
+        # Try to screenshot the main <table>. If not found, capture full page.
         try:
-            table = page.locator("table")
-            await table.screenshot(path=png, animations="disabled", timeout=5000)
-        except:
-            await page.screenshot(path=png, full_page=True, animations="disabled")
+            table = page.locator("table").first
+            await table.screenshot(path=out_png, animations="disabled", timeout=8000)
+        except Exception:
+            await page.screenshot(path=out_png, full_page=True, animations="disabled")
         await browser.close()
+
 asyncio.run(main())
+print("Saved", out_png)
 PY
-          echo "DEBUG: after Playwright fallback:"; ls -lah out || true
+          ls -lah out
 
-      - name: Upload artifacts (optional)
-        uses: actions/upload-artifact@v4
-        with:
-          name: meme-screener-${{ github.run_id }}
-          path: out/
-
-      # ============ Discord: verbose, fail-safe ============
-      - name: Notify Discord (verbose, fail-safe)
-        env:
-          DISCORD_WEBHOOK_URL: ${{ env.DISCORD_WEBHOOK_URL }}
+      - name: Rename backtest to a clean name (if present)
         run: |
-          set -euo pipefail
+          set -euxo pipefail
+          # Your script usually writes meme_rsps_backtest.png; normalize to backtest.png
+          if [ -f out/meme_rsps_backtest.png ]; then
+            mv -f out/meme_rsps_backtest.png out/backtest.png
+          elif ls out/*backtest*.png 1>/dev/null 2>&1; then
+            mv -f $(ls out/*backtest*.png | head -n1) out/backtest.png
+          fi
+          ls -lah out
+
+      - name: Post to Discord (2 screenshots + csv if exists)
+        run: |
+          set -euxo pipefail
           SYD_DATE="$(date +%Y-%m-%d)"
+          SUMMARY="Meme Screener — ${SYD_DATE}\nTable + equity curve."
 
-          echo "DEBUG: listing out/ before post …"
-          ls -lah out || true
-
-          SUMMARY="Meme Screener — ${SYD_DATE}\nBacktest and table snapshot."
-          echo "DEBUG: Sending base message to Discord…"
-          curl -sS -o /tmp/resp1.txt -w "HTTP:%{http_code}\n" \
-            -H "Content-Type: application/json" \
-            -X POST "$DISCORD_WEBHOOK_URL" \
-            -d "{\"content\":\"${SUMMARY}\"}"
-          echo "DEBUG: Base response:"; cat /tmp/resp1.txt || true
+          # Always send a small base message so we know webhook works
+          curl -sS -H "Content-Type: application/json" \
+               -X POST "$DISCORD_WEBHOOK_URL" \
+               -d "{\"content\":\"${SUMMARY}\"}" >/dev/null
 
           declare -a args
-          # Prefer the table PNG produced (wkhtmltoimage or Playwright)
-          if [ -f out/meme_screener_daily_table.png ]; then
-            echo "DEBUG: Attaching table PNG"
-            args+=(-F "file1=@out/meme_screener_daily_table.png;type=image/png;filename=table-${SYD_DATE}.png")
-          fi
-          # Attach any backtest PNG we can find
-          BACKTEST="$(ls out/*backtest*.png 2>/dev/null | head -n1 || true)"
-          if [ -n "${BACKTEST}" ]; then
-            echo "DEBUG: Attaching backtest PNG: ${BACKTEST}"
-            args+=(-F "file2=@${BACKTEST};type=image/png;filename=backtest-${SYD_DATE}.png")
-          fi
-          # Attach a CSV if present
-          CSV="$(ls out/*.csv 2>/dev/null | head -n1 || true)"
-          if [ -n "${CSV}" ]; then
-            echo "DEBUG: Attaching CSV: ${CSV}"
-            args+=(-F "file3=@${CSV};type=text/csv;filename=screener-${SYD_DATE}.csv")
-          fi
+          [ -f out/table.png ]    && args+=(-F "file1=@out/table.png;type=image/png;filename=table-${SYD_DATE}.png")
+          [ -f out/backtest.png ] && args+=(-F "file2=@out/backtest.png;type=image/png;filename=backtest-${SYD_DATE}.png")
+          [ -f out/meme_screener_daily.csv ] && args+=(-F "file3=@out/meme_screener_daily.csv;type=text/csv;filename=screener-${SYD_DATE}.csv")
 
           if [ ${#args[@]} -gt 0 ]; then
-            echo "DEBUG: Posting attachments…"
-            curl -sS -o /tmp/resp2.txt -w "HTTP:%{http_code}\n" \
-              -X POST "$DISCORD_WEBHOOK_URL" \
-              -F "payload_json={\"content\":\"Attachments for ${SYD_DATE}\"}" \
-              "${args[@]}"
-            echo "DEBUG: Attachment response:"; cat /tmp/resp2.txt || true
+            curl -sS -X POST "$DISCORD_WEBHOOK_URL" \
+                 -F "payload_json={\"content\":\"Attachments for ${SYD_DATE}\"}" \
+                 "${args[@]}" >/dev/null
           else
-            echo "DEBUG: No attachments found in out/."
+            echo "No attachments found; only sent base message."
           fi
+
 
 
 
