@@ -2,8 +2,8 @@ name: Meme Screener — 2 screenshots daily
 
 on:
   schedule:
-    - cron: "0 0 * * *"        # 00:00 UTC daily
-  workflow_dispatch: {}        # <-- this makes the Run button
+    - cron: "0 0 * * *"        # 00:00 UTC every day (UTC close)
+  workflow_dispatch: {}        # Manual Run button
 
 jobs:
   run:
@@ -12,6 +12,7 @@ jobs:
     env:
       TZ: Australia/Sydney
       MPLBACKEND: Agg
+      # Hard-wired creds (move to repo Secrets later if you like)
       CRYPTOCOMPARE_API_KEY: d5ddb7a7f49de4d4a8af07e98e0ebf437e7acc8bb282f12af978320486f741e7
       DISCORD_WEBHOOK_URL: https://discord.com/api/webhooks/1429701285975949322/fS0y9EkVQtnP15CJkAQEHEdpgL5Hlk43-Ct4D9uyZjjJT2jbk9nPkETT5cbbGGDyPVqD
 
@@ -55,21 +56,24 @@ jobs:
           if [ ! -f out/meme_screener_daily.html ]; then
             echo "No HTML to screenshot"; exit 0; fi
           python - <<'PY'
-import pathlib, asyncio
-from playwright.async_api import async_playwright
-html = pathlib.Path("out/meme_screener_daily.html").resolve().as_uri()
-async def shot():
-    async with async_playwright() as p:
-        b = await p.chromium.launch()
-        c = await b.new_context(viewport={"width":1600,"height":1200})
-        page = await c.new_page()
-        await page.goto(html, wait_until="load")
-        try:
-            await page.locator("table").first.screenshot(path="out/table.png", animations="disabled", timeout=8000)
-        except:
-            await page.screenshot(path="out/table.png", full_page=True, animations="disabled")
-        await b.close()
-asyncio.run(shot())
+from pathlib import Path
+from playwright.sync_api import sync_playwright
+
+html = Path("out/meme_screener_daily.html").resolve().as_uri()
+out_png = "out/table.png"
+
+with sync_playwright() as p:
+    browser = p.chromium.launch()
+    ctx = browser.new_context(viewport={"width":1600, "height":1200}, device_scale_factor=1)
+    page = ctx.new_page()
+    page.goto(html, wait_until="load")
+    try:
+        page.locator("table").first.screenshot(path=out_png, animations="disabled", timeout=8000)
+    except Exception:
+        page.screenshot(path=out_png, full_page=True, animations="disabled")
+    browser.close()
+
+print("Saved", out_png)
 PY
           ls -lah out
 
@@ -85,6 +89,7 @@ PY
       - name: Post to Discord (2 screenshots + csv if exists)
         run: |
           SYD_DATE="$(date +%Y-%m-%d)"
+          # Base message (so you always see something)
           curl -sS -H "Content-Type: application/json" \
                -X POST "$DISCORD_WEBHOOK_URL" \
                -d "{\"content\":\"Meme Screener — ${SYD_DATE}\\nTable + equity curve.\"}" >/dev/null
@@ -101,6 +106,13 @@ PY
           else
             echo "No attachments found; only sent base message."
           fi
+
+      - name: Upload artifacts (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: meme-screener-${{ github.run_id }}
+          path: out/
+
 
 
 
