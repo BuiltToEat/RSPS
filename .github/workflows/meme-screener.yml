@@ -2,8 +2,8 @@ name: Meme Screener — 2 screenshots daily
 
 on:
   schedule:
-    - cron: "0 0 * * *"        # 00:00 UTC every day (UTC close)
-  workflow_dispatch: {}        # Manual Run button
+    - cron: "0 0 * * *"        # 00:00 UTC daily
+  workflow_dispatch: {}        # manual Run button
 
 jobs:
   run:
@@ -12,7 +12,6 @@ jobs:
     env:
       TZ: Australia/Sydney
       MPLBACKEND: Agg
-      # Hard-wired creds (move to repo Secrets later if you like)
       CRYPTOCOMPARE_API_KEY: d5ddb7a7f49de4d4a8af07e98e0ebf437e7acc8bb282f12af978320486f741e7
       DISCORD_WEBHOOK_URL: https://discord.com/api/webhooks/1429701285975949322/fS0y9EkVQtnP15CJkAQEHEdpgL5Hlk43-Ct4D9uyZjjJT2jbk9nPkETT5cbbGGDyPVqD
 
@@ -33,28 +32,54 @@ jobs:
           else
             pip install numpy pandas requests matplotlib
           fi
-          # Needed by pandas Styler (HTML)
           pip install "jinja2>=3.1,<4"
 
       - name: Run screener (ALT LEAGUE, no extension)
         run: |
           echo "Sydney: $(date)"
-          python "ALT LEAGUE"
+          python "ALT LEAGUE" || true   # don't kill the job if script exits non-zero
 
-      - name: Gather outputs
+      - name: Show repo tree (for debugging)
+        run: |
+          echo "==== TREE (top level) ===="
+          ls -lah
+          echo "==== TREE (one level down) ===="
+          find . -maxdepth 2 -type f -printf "%p\t%k KB\n" | sort
+
+      # ---- Hunt for outputs anywhere, copy to out/ ----
+      - name: Hunt + collect outputs
         run: |
           set -e
           mkdir -p out
-          cp -f meme_screener_daily.html out/ || true
-          cp -f meme_screener_daily.csv  out/ || true
-          cp -f meme_rsps_backtest.png   out/ || true
-          # If your script used different names, grab them too:
-          shopt -s nullglob
-          for f in *backtest*.png; do cp -f "$f" out/; done
-          echo "Root files:"; ls -lah
-          echo "out files:"; ls -lah out
 
-      # --- Make a PNG of the HTML table (no Python, just wkhtmltoimage) ---
+          # 1) Try expected names
+          for f in meme_screener_daily.html meme_screener_daily.csv meme_rsps_backtest.png; do
+            [ -f "$f" ] && cp -f "$f" out/
+          done
+
+          # 2) Otherwise, scan the repo for likely files and copy the first match of each kind
+          # HTML (table)
+          if [ ! -f out/meme_screener_daily.html ]; then
+            H=$(find . -type f -iname "*screener*.html" -print | head -n1 || true)
+            [ -n "$H" ] && cp -f "$H" out/meme_screener_daily.html
+          fi
+
+          # CSV (data)
+          if [ ! -f out/meme_screener_daily.csv ]; then
+            C=$(find . -type f -iname "*screener*.csv" -print | head -n1 || true)
+            [ -n "$C" ] && cp -f "$C" out/meme_screener_daily.csv
+          fi
+
+          # Backtest PNG (equity curve)
+          if [ ! -f out/meme_rsps_backtest.png ]; then
+            P=$(find . -type f -iname "*backtest*.png" -print | head -n1 || true)
+            [ -n "$P" ] && cp -f "$P" out/meme_rsps_backtest.png
+          fi
+
+          echo "==== out/ after collect ===="
+          ls -lah out || true
+
+      # ---- Make a PNG of the HTML table (if we have HTML) ----
       - name: Install wkhtmltoimage
         run: |
           sudo apt-get update
@@ -64,8 +89,11 @@ jobs:
       - name: Screenshot table → out/table.png
         run: |
           if [ -f out/meme_screener_daily.html ]; then
+            echo "Rendering table.png from out/meme_screener_daily.html"
             wkhtmltoimage --width 1800 --quality 95 \
               out/meme_screener_daily.html out/table.png || true
+          else
+            echo "No HTML found to render table.png"
           fi
           ls -lah out || true
 
@@ -78,29 +106,50 @@ jobs:
           fi
           ls -lah out || true
 
-      - name: Post to Discord (exactly 2 screenshots + csv if exists)
+      # ---- Post to Discord; print HTTP codes so we SEE if uploads worked ----
+      - name: Post to Discord (2 screenshots + csv if exists; verbose)
         run: |
+          set -e
           SYD_DATE="$(date +%Y-%m-%d)"
-          # Base message so you always see something
-          curl -sS -H "Content-Type: application/json" \
-               -X POST "$DISCORD_WEBHOOK_URL" \
-               -d "{\"content\":\"Meme Screener — ${SYD_DATE}\\nTable + equity curve.\"}" >/dev/null
 
-          # If table.png didn't render, attach the HTML instead so you still see the table
+          echo "DEBUG: listing out/ before post"
+          ls -lah out || true
+
+          echo "DEBUG: Sending base message"
+          curl -sS -o /tmp/resp1.txt -w "HTTP:%{http_code}\n" \
+               -H "Content-Type: application/json" \
+               -X POST "$DISCORD_WEBHOOK_URL" \
+               -d "{\"content\":\"Meme Screener — ${SYD_DATE}\nTable + equity curve.\"}"
+          echo "DEBUG: Base response:"
+          cat /tmp/resp1.txt || true
+
           declare -a args
           if [ -f out/table.png ]; then
+            echo "DEBUG: Will attach table.png"
             args+=(-F "file1=@out/table.png;type=image/png;filename=table-${SYD_DATE}.png")
           elif [ -f out/meme_screener_daily.html ]; then
+            echo "DEBUG: table.png missing; will attach HTML instead"
             args+=(-F "file1=@out/meme_screener_daily.html;type=text/html;filename=table-${SYD_DATE}.html")
           fi
-
-          [ -f out/backtest.png ] && args+=(-F "file2=@out/backtest.png;type=image/png;filename=backtest-${SYD_DATE}.png")
-          [ -f out/meme_screener_daily.csv ] && args+=(-F "file3=@out/meme_screener_daily.csv;type=text/csv;filename=screener-${SYD_DATE}.csv")
+          if [ -f out/backtest.png ]; then
+            echo "DEBUG: Will attach backtest.png"
+            args+=(-F "file2=@out/backtest.png;type=image/png;filename=backtest-${SYD_DATE}.png")
+          fi
+          if [ -f out/meme_screener_daily.csv ]; then
+            echo "DEBUG: Will attach CSV"
+            args+=(-F "file3=@out/meme_screener_daily.csv;type=text/csv;filename=screener-${SYD_DATE}.csv")
+          fi
 
           if [ ${#args[@]} -gt 0 ]; then
-            curl -sS -X POST "$DISCORD_WEBHOOK_URL" \
+            echo "DEBUG: Posting attachments"
+            curl -sS -o /tmp/resp2.txt -w "HTTP:%{http_code}\n" \
+                 -X POST "$DISCORD_WEBHOOK_URL" \
                  -F "payload_json={\"content\":\"Attachments for ${SYD_DATE}\"}" \
-                 "${args[@]}" >/dev/null
+                 "${args[@]}"
+            echo "DEBUG: Attachment response:"
+            cat /tmp/resp2.txt || true
+          else
+            echo "DEBUG: No attachments found; only base message sent."
           fi
 
       - name: Upload artifacts (optional)
@@ -108,6 +157,7 @@ jobs:
         with:
           name: meme-screener-${{ github.run_id }}
           path: out/
+
 
 
 
