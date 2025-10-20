@@ -1,9 +1,9 @@
-name: Meme Screener — 2 screenshots daily
+name: Meme Screener — 2 screenshots daily (compressed)
 
 on:
   schedule:
     - cron: "0 0 * * *"        # 00:00 UTC daily
-  workflow_dispatch: {}        # manual Run button
+  workflow_dispatch: {}        # Manual Run button
 
 jobs:
   run:
@@ -37,119 +37,112 @@ jobs:
       - name: Run screener (ALT LEAGUE, no extension)
         run: |
           echo "Sydney: $(date)"
-          python "ALT LEAGUE" || true   # don't kill the job if script exits non-zero
+          python "ALT LEAGUE" || true
 
       - name: Show repo tree (for debugging)
         run: |
-          echo "==== TREE (top level) ===="
-          ls -lah
-          echo "==== TREE (one level down) ===="
-          find . -maxdepth 2 -type f -printf "%p\t%k KB\n" | sort
+          echo "==== TREE top ===="; ls -lah
+          echo "==== TREE 2-deep ===="; find . -maxdepth 2 -type f -printf "%p\t%k KB\n" | sort
 
-      # ---- Hunt for outputs anywhere, copy to out/ ----
       - name: Hunt + collect outputs
         run: |
           set -e
           mkdir -p out
-
-          # 1) Try expected names
+          # Try expected names
           for f in meme_screener_daily.html meme_screener_daily.csv meme_rsps_backtest.png; do
             [ -f "$f" ] && cp -f "$f" out/
           done
+          # Fallback scan
+          [ ! -f out/meme_screener_daily.html ] && H=$(find . -type f -iname "*screener*.html" -print | head -n1 || true) && [ -n "$H" ] && cp -f "$H" out/meme_screener_daily.html
+          [ ! -f out/meme_screener_daily.csv ]  && C=$(find . -type f -iname "*screener*.csv"  -print | head -n1 || true) && [ -n "$C" ] && cp -f "$C" out/meme_screener_daily.csv
+          [ ! -f out/meme_rsps_backtest.png ]   && P=$(find . -type f -iname "*backtest*.png"   -print | head -n1 || true) && [ -n "$P" ] && cp -f "$P" out/meme_rsps_backtest.png
+          echo "==== out/ after collect ===="; ls -lah out || true
 
-          # 2) Otherwise, scan the repo for likely files and copy the first match of each kind
-          # HTML (table)
-          if [ ! -f out/meme_screener_daily.html ]; then
-            H=$(find . -type f -iname "*screener*.html" -print | head -n1 || true)
-            [ -n "$H" ] && cp -f "$H" out/meme_screener_daily.html
-          fi
-
-          # CSV (data)
-          if [ ! -f out/meme_screener_daily.csv ]; then
-            C=$(find . -type f -iname "*screener*.csv" -print | head -n1 || true)
-            [ -n "$C" ] && cp -f "$C" out/meme_screener_daily.csv
-          fi
-
-          # Backtest PNG (equity curve)
-          if [ ! -f out/meme_rsps_backtest.png ]; then
-            P=$(find . -type f -iname "*backtest*.png" -print | head -n1 || true)
-            [ -n "$P" ] && cp -f "$P" out/meme_rsps_backtest.png
-          fi
-
-          echo "==== out/ after collect ===="
-          ls -lah out || true
-
-      # ---- Make a PNG of the HTML table (if we have HTML) ----
-      - name: Install wkhtmltoimage
+      # Make JPEG screenshots and compress if needed
+      - name: Install screenshot + image tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y wkhtmltopdf
+          sudo apt-get install -y wkhtmltopdf imagemagick
           wkhtmltoimage --version || true
+          convert --version || true
 
-      - name: Screenshot table → out/table.png
+      - name: Render table → out/table.jpg (small)
         run: |
           if [ -f out/meme_screener_daily.html ]; then
-            echo "Rendering table.png from out/meme_screener_daily.html"
-            wkhtmltoimage --width 1800 --quality 95 \
-              out/meme_screener_daily.html out/table.png || true
-          else
-            echo "No HTML found to render table.png"
+            # Render directly to JPEG with moderate width/quality
+            wkhtmltoimage --width 1500 --quality 82 --format jpg \
+              out/meme_screener_daily.html out/table.jpg || true
           fi
           ls -lah out || true
 
-      - name: Normalize backtest name (→ out/backtest.png)
+      - name: Normalize backtest → out/backtest.jpg (small)
         run: |
           if [ -f out/meme_rsps_backtest.png ]; then
-            mv -f out/meme_rsps_backtest.png out/backtest.png
+            # Convert/resize/compress to JPEG to stay small
+            convert out/meme_rsps_backtest.png -resize 1600x -strip -quality 85 out/backtest.jpg
           elif ls out/*backtest*.png 1>/dev/null 2>&1; then
-            mv -f "$(ls out/*backtest*.png | head -n1)" out/backtest.png
+            SRC="$(ls out/*backtest*.png | head -n1)"
+            convert "$SRC" -resize 1600x -strip -quality 85 out/backtest.jpg
           fi
           ls -lah out || true
 
-      # ---- Post to Discord; print HTTP codes so we SEE if uploads worked ----
-      - name: Post to Discord (2 screenshots + csv if exists; verbose)
+      - name: Ensure images < 7.5 MB (recompress loop)
+        run: |
+          shrink() {
+            IMG="$1"
+            [ -f "$IMG" ] || return 0
+            # bytes
+            SZ=$(stat -c%s "$IMG")
+            LIM=$((7500*1024))
+            if [ "$SZ" -le "$LIM" ]; then
+              echo "$IMG size OK: $((SZ/1024)) KB"
+              return 0
+            fi
+            echo "$IMG too big ($((SZ/1024)) KB) -> recompressing..."
+            # progressively reduce quality until under limit or floor
+            Q=80
+            while [ "$SZ" -gt "$LIM" ] && [ "$Q" -ge 50 ]; do
+              convert "$IMG" -strip -quality $Q -resize 1600x "$IMG"
+              SZ=$(stat -c%s "$IMG")
+              echo "  -> quality $Q -> $((SZ/1024)) KB"
+              Q=$((Q-5))
+            done
+          }
+          shrink out/table.jpg
+          shrink out/backtest.jpg
+          ls -lah out || true
+
+      - name: Post to Discord (2 screenshots + csv; with HTTP codes)
         run: |
           set -e
           SYD_DATE="$(date +%Y-%m-%d)"
+          echo "DEBUG: out/ before post"; ls -lah out || true
 
-          echo "DEBUG: listing out/ before post"
-          ls -lah out || true
-
-          echo "DEBUG: Sending base message"
+          echo "DEBUG: base message"
           curl -sS -o /tmp/resp1.txt -w "HTTP:%{http_code}\n" \
                -H "Content-Type: application/json" \
                -X POST "$DISCORD_WEBHOOK_URL" \
                -d "{\"content\":\"Meme Screener — ${SYD_DATE}\nTable + equity curve.\"}"
-          echo "DEBUG: Base response:"
-          cat /tmp/resp1.txt || true
+          echo "Base response:"; cat /tmp/resp1.txt || true
 
           declare -a args
-          if [ -f out/table.png ]; then
-            echo "DEBUG: Will attach table.png"
-            args+=(-F "file1=@out/table.png;type=image/png;filename=table-${SYD_DATE}.png")
+          if [ -f out/table.jpg ]; then
+            args+=(-F "file1=@out/table.jpg;type=image/jpeg;filename=table-${SYD_DATE}.jpg")
           elif [ -f out/meme_screener_daily.html ]; then
-            echo "DEBUG: table.png missing; will attach HTML instead"
             args+=(-F "file1=@out/meme_screener_daily.html;type=text/html;filename=table-${SYD_DATE}.html")
           fi
-          if [ -f out/backtest.png ]; then
-            echo "DEBUG: Will attach backtest.png"
-            args+=(-F "file2=@out/backtest.png;type=image/png;filename=backtest-${SYD_DATE}.png")
-          fi
-          if [ -f out/meme_screener_daily.csv ]; then
-            echo "DEBUG: Will attach CSV"
-            args+=(-F "file3=@out/meme_screener_daily.csv;type=text/csv;filename=screener-${SYD_DATE}.csv")
-          fi
+          [ -f out/backtest.jpg ] && args+=(-F "file2=@out/backtest.jpg;type=image/jpeg;filename=backtest-${SYD_DATE}.jpg")
+          [ -f out/meme_screener_daily.csv ] && args+=(-F "file3=@out/meme_screener_daily.csv;type=text/csv;filename=screener-${SYD_DATE}.csv")
 
           if [ ${#args[@]} -gt 0 ]; then
-            echo "DEBUG: Posting attachments"
+            echo "DEBUG: posting attachments"
             curl -sS -o /tmp/resp2.txt -w "HTTP:%{http_code}\n" \
                  -X POST "$DISCORD_WEBHOOK_URL" \
                  -F "payload_json={\"content\":\"Attachments for ${SYD_DATE}\"}" \
                  "${args[@]}"
-            echo "DEBUG: Attachment response:"
-            cat /tmp/resp2.txt || true
+            echo "Attachment response:"; cat /tmp/resp2.txt || true
           else
-            echo "DEBUG: No attachments found; only base message sent."
+            echo "No attachments found."
           fi
 
       - name: Upload artifacts (optional)
@@ -157,6 +150,7 @@ jobs:
         with:
           name: meme-screener-${{ github.run_id }}
           path: out/
+
 
 
 
