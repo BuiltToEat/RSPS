@@ -2,8 +2,8 @@ name: Meme Screener — 2 screenshots daily
 
 on:
   schedule:
-    - cron: "0 0 * * *"        # 00:00 UTC every day (UTC close)
-  workflow_dispatch: {}        # manual Run workflow button
+    - cron: "0 0 * * *"        # 00:00 UTC daily
+  workflow_dispatch: {}        # <-- this makes the Run button
 
 jobs:
   run:
@@ -12,7 +12,6 @@ jobs:
     env:
       TZ: Australia/Sydney
       MPLBACKEND: Agg
-      # Hard-wired creds per your request. (Move to repo secrets later if you want.)
       CRYPTOCOMPARE_API_KEY: d5ddb7a7f49de4d4a8af07e98e0ebf437e7acc8bb282f12af978320486f741e7
       DISCORD_WEBHOOK_URL: https://discord.com/api/webhooks/1429701285975949322/fS0y9EkVQtnP15CJkAQEHEdpgL5Hlk43-Ct4D9uyZjjJT2jbk9nPkETT5cbbGGDyPVqD
 
@@ -33,10 +32,7 @@ jobs:
           else
             pip install numpy pandas requests matplotlib
           fi
-          # Needed for pandas Styler HTML
-          pip install "jinja2>=3.1,<4"
-          # For HTML screenshot
-          python -m pip install playwright
+          pip install "jinja2>=3.1,<4" playwright
           python -m playwright install --with-deps chromium
 
       - name: Run screener (ALT LEAGUE, no extension)
@@ -46,69 +42,52 @@ jobs:
 
       - name: Gather outputs
         run: |
-          set -euxo pipefail
+          set -e
           mkdir -p out
-          # Known names (your script should already create these)
           cp -f meme_screener_daily.html out/ || true
           cp -f meme_screener_daily.csv  out/ || true
           cp -f meme_rsps_backtest.png   out/ || true
-          echo "Repo root files:"; ls -lah
-          echo "out/ files:"; ls -lah out
+          echo "Root files:"; ls -lah
+          echo "out files:"; ls -lah out
 
-      - name: Screenshot table (Playwright)
+      - name: Screenshot table (Playwright → out/table.png)
         run: |
-          set -euxo pipefail
           if [ ! -f out/meme_screener_daily.html ]; then
-            echo "No HTML found – cannot screenshot the table."
-            exit 0
-          fi
+            echo "No HTML to screenshot"; exit 0; fi
           python - <<'PY'
 import pathlib, asyncio
 from playwright.async_api import async_playwright
-
 html = pathlib.Path("out/meme_screener_daily.html").resolve().as_uri()
-out_png = "out/table.png"
-
-async def main():
+async def shot():
     async with async_playwright() as p:
-        browser = await p.chromium.launch()
-        ctx = await browser.new_context(viewport={"width":1600,"height":1200}, device_scale_factor=1)
-        page = await ctx.new_page()
+        b = await p.chromium.launch()
+        c = await b.new_context(viewport={"width":1600,"height":1200})
+        page = await c.new_page()
         await page.goto(html, wait_until="load")
-        # Try to screenshot the main <table>. If not found, capture full page.
         try:
-            table = page.locator("table").first
-            await table.screenshot(path=out_png, animations="disabled", timeout=8000)
-        except Exception:
-            await page.screenshot(path=out_png, full_page=True, animations="disabled")
-        await browser.close()
-
-asyncio.run(main())
-print("Saved", out_png)
+            await page.locator("table").first.screenshot(path="out/table.png", animations="disabled", timeout=8000)
+        except:
+            await page.screenshot(path="out/table.png", full_page=True, animations="disabled")
+        await b.close()
+asyncio.run(shot())
 PY
           ls -lah out
 
-      - name: Rename backtest to a clean name (if present)
+      - name: Normalize backtest name (→ out/backtest.png)
         run: |
-          set -euxo pipefail
-          # Your script usually writes meme_rsps_backtest.png; normalize to backtest.png
           if [ -f out/meme_rsps_backtest.png ]; then
             mv -f out/meme_rsps_backtest.png out/backtest.png
           elif ls out/*backtest*.png 1>/dev/null 2>&1; then
-            mv -f $(ls out/*backtest*.png | head -n1) out/backtest.png
+            mv -f "$(ls out/*backtest*.png | head -n1)" out/backtest.png
           fi
           ls -lah out
 
       - name: Post to Discord (2 screenshots + csv if exists)
         run: |
-          set -euxo pipefail
           SYD_DATE="$(date +%Y-%m-%d)"
-          SUMMARY="Meme Screener — ${SYD_DATE}\nTable + equity curve."
-
-          # Always send a small base message so we know webhook works
           curl -sS -H "Content-Type: application/json" \
                -X POST "$DISCORD_WEBHOOK_URL" \
-               -d "{\"content\":\"${SUMMARY}\"}" >/dev/null
+               -d "{\"content\":\"Meme Screener — ${SYD_DATE}\\nTable + equity curve.\"}" >/dev/null
 
           declare -a args
           [ -f out/table.png ]    && args+=(-F "file1=@out/table.png;type=image/png;filename=table-${SYD_DATE}.png")
@@ -122,6 +101,7 @@ PY
           else
             echo "No attachments found; only sent base message."
           fi
+
 
 
 
