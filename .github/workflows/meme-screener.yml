@@ -1,0 +1,73 @@
+name: Meme Screener Daily (UTC Close)
+
+on:
+  schedule:
+    # 00:00 UTC every day (UTC close). ~11:00 AM Sydney during AEDT, ~10:00 AM during AEST.
+    - cron: "0 0 * * *"
+  workflow_dispatch: {}   # Manual "Run workflow" button
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      MPLBACKEND: Agg
+      TZ: Australia/Sydney
+
+      # --- RECOMMENDED: keep secrets in repo Settings → Secrets and variables → Actions ---
+      # CRYPTOCOMPARE_API_KEY: ${{ secrets.CRYPTOCOMPARE_API_KEY }}
+      # DISCORD_WEBHOOK_URL:  ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+      # --- Inline (only if you insist; not recommended) ---
+      # CRYPTOCOMPARE_API_KEY: d5ddb7a7f49de4d4a8af07e98e0ebf437e7acc8bb282f12af978320486f741e7
+      # DISCORD_WEBHOOK_URL:  https://canary.discord.com/api/webhooks/1429701285975949322/fS0y9EkVQtnP15CJkAQEHEdpgL5Hlk43-Ct4D9uyZjjJT2jbk9nPkETT5cbbGGDyPVqD
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install numpy pandas requests matplotlib
+          fi
+
+      - name: Run screener (ALT LEAGUE with no extension)
+        env:
+          CRYPTOCOMPARE_API_KEY: ${{ env.CRYPTOCOMPARE_API_KEY || secrets.CRYPTOCOMPARE_API_KEY }}
+        run: |
+          echo "Sydney date/time: $(date)"
+          python "ALT LEAGUE"   # <- no .py, quoted for the space
+
+      - name: Collect outputs
+        run: |
+          mkdir -p out
+          cp meme_screener_daily.html out/ || true
+          cp meme_screener_daily.csv  out/ || true
+          cp meme_rsps_backtest.png   out/ || true
+
+      - name: Upload artifacts (optional)
+        uses: actions/upload-artifact@v4
+        with:
+          name: meme-screener-${{ github.run_id }}
+          path: out/
+
+      - name: Notify Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ env.DISCORD_WEBHOOK_URL || secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          SYD_DATE="$(date +%Y-%m-%d)"
+          SUMMARY="Meme Screener — ${SYD_DATE}\nTop coins & risk metrics with log-scale backtest vs BTC."
+          args=(-F "payload_json={\"content\":\"${SUMMARY}\"}")
+          [ -f out/meme_screener_daily.html ] && args+=(-F "file1=@out/meme_screener_daily.html;type=text/html;filename=screener-${SYD_DATE}.html")
+          [ -f out/meme_screener_daily.csv ]  && args+=(-F "file2=@out/meme_screener_daily.csv;type=text/csv;filename=screener-${SYD_DATE}.csv")
+          [ -f out/meme_rsps_backtest.png ]   && args+=(-F "file3=@out/meme_rsps_backtest.png;type=image/png;filename=backtest-${SYD_DATE}.png")
+          curl -sS -X POST "$DISCORD_WEBHOOK_URL" "${args[@]}"
