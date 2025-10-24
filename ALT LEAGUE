@@ -1,24 +1,20 @@
-# ============================= Meme-Coin Screener (Fast + Free) =============================
-# Data: Binance (primary, no key) + CryptoCompare fallback (key supported)
-# Caching: .ohlcv_cache/ (persists across runs if you enable Actions cache)
-# Output: HTML + table PNG + equity PNG
-# Discord: ONE message with BOTH images attached
+# ============================= Meme-Coin Screener — CC ONLY (cached, throttle-safe) =============================
+# Data: CryptoCompare only. No Binance.
+# Cache: .cc_cache/ to avoid redownloading history.
+# Output: HTML + table PNG + equity PNG. Optional Discord post.
 
 import os, time, math, random, webbrowser
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, date, timezone
 import numpy as np
 import pandas as pd
 import requests
 
-# ---- non-GUI backend for CI
+# Non-interactive backend for CI
 os.environ.setdefault("MPLBACKEND", "Agg")
-try:
-    import matplotlib.pyplot as plt
-    from matplotlib.patches import Rectangle
-except Exception:
-    plt = None
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 
-# ============================= CONFIG =============================
+# ------------------------------ CONFIG ------------------------------
 MEME_TICKERS = [
     "DOGE","SHIB","PEPE","FLOKI","BONK","WIF","BOME","POPCAT","PONKE","MEW","MYRO","MOG",
     "WOJAK","MAGA","TURBO","AIDOGE","ELON","PORK","LADYS","KISHU","AKITA","HOGE","PEPE2",
@@ -39,125 +35,50 @@ MIN_SHOW_WEIGHT    = 0.25
 
 OUT_HTML       = "meme_screener_daily.html"
 OUT_CSV        = "meme_screener_daily.csv"
-OUT_PNG        = "meme_rsps_backtest.png"       # equity curve
-OUT_TABLE_PNG  = "meme_screener_table.png"      # table
+OUT_TABLE_PNG  = "meme_screener_table.png"
+OUT_PNG        = "meme_rsps_backtest.png"
 OPEN_AFTER_SAVE = (not os.getenv("CI"))
 RUN_BACKTEST    = True
 
 BACKTEST_START = "2021-01-01"
 BACKTEST_END   = None
 
-# Keys
+# ----- CryptoCompare key (env or embed) -----
 DEFAULT_CRYPTOCOMPARE_API_KEY = "d5ddb7a7f49de4d4a8af07e98e0ebf437e7acc8bb282f12af978320486f741e7"
-DEFAULT_DISCORD_WEBHOOK = ""  # optional fallback; prefer env DISCORD_WEBHOOK_URL
 
-# Caching
-CACHE_DIR = ".ohlcv_cache"
+# ----- Rate-limit friendliness -----
+MAX_RETRIES = 3                 # keep low so we don't stall forever
+BASE_SLEEP  = 0.6               # base backoff
+WAIT_CAP    = 5.0               # max sleep per retry
+SLEEP_BETWEEN_SYMBOLS = 0.5     # tiny pause between coins
+
+# ----- Caching -----
+CACHE_DIR = ".cc_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# CC retry knobs (gentle)
-MAX_RETRIES = 3
-BASE_SLEEP  = 0.5
-WAIT_CAP    = 5.0
+# Exchanges to try (None = CCCAGG)
+EXCHANGES_TRY = ["BINANCE","BYBIT","OKX","KUCOIN","BITGET","GATEIO","KRAKEN","COINBASE", None]
 
 SESSION = requests.Session()
 np.set_printoptions(suppress=True)
 pd.set_option("display.width", 180)
 pd.set_option("display.max_columns", 50)
 
-# ============================= LOG =============================
 def log(msg): print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
-# ============================= DATA HELPERS =============================
-def _cache_path(source, sym, quote, tag):
-    t = tag or "agg"
-    return os.path.join(CACHE_DIR, f"{source.lower()}_{sym}_{quote}_{t}.parquet")
-
-# ---------- BINANCE (primary) ----------
-def fetch_binance_histoday(symbol, start="2021-01-01", quote="USDT"):
-    """Fetch daily klines from Binance for SYMBOL+quote (e.g., DOGEUSDT)."""
-    pair = f"{symbol}{quote}"
-    url  = "https://api.binance.com/api/v3/klines"
-    start_dt = pd.to_datetime(start).tz_localize("UTC")
-    end_ms   = int(datetime.now(timezone.utc).timestamp() * 1000)
-    limit    = 1000
-    out = []
-
-    # Check if pair exists quickly
-    try:
-        info = SESSION.get("https://api.binance.com/api/v3/exchangeInfo", timeout=20).json()
-        syms = {s["symbol"] for s in info.get("symbols", [])}
-        if pair not in syms:
-            return pd.DataFrame()  # not on Binance
-    except Exception:
-        # if exchangeInfo fails, still try klines (Binance often ok)
-        pass
-
-    start_ms = int(start_dt.timestamp() * 1000)
-    while True:
-        params = {"symbol": pair, "interval": "1d", "startTime": start_ms, "limit": limit}
-        r = SESSION.get(url, params=params, timeout=30)
-        if r.status_code == 429:
-            time.sleep(0.5); continue
-        r.raise_for_status()
-        data = r.json()
-        if not data:
-            break
-        out.extend(data)
-        last_open = data[-1][0]
-        # advance by 1 day
-        next_ms = last_open + 24*60*60*1000
-        if next_ms >= end_ms or len(data) < limit:
-            break
-        start_ms = next_ms
-        time.sleep(0.15)  # be polite
-
-    if not out:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(out, columns=[
-        "open_time","Open","High","Low","Close","VolumeFrom","close_time","QuoteVolume",
-        "trades","taker_base","taker_quote","ignore"
-    ])
-    df["Open"]  = df["Open"].astype(float)
-    df["High"]  = df["High"].astype(float)
-    df["Low"]   = df["Low"].astype(float)
-    df["Close"] = df["Close"].astype(float)
-    df["VolumeFrom"] = df["VolumeFrom"].astype(float)        # base asset vol
-    df["VolumeTo"]   = df["QuoteVolume"].astype(float)       # quote vol = dollar-ish
-    df["Date"] = pd.to_datetime(df["open_time"], unit="ms", utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
-    df = df.set_index("Date")[["Open","High","Low","Close","VolumeFrom","VolumeTo"]]
-    return df
-
-def get_ohlcv_binance_cached(sym, start="2021-01-01", quote="USDT"):
-    path = _cache_path("binance", sym, quote, None)
-    if os.path.exists(path):
-        try:
-            df = pd.read_parquet(path)
-            # append the last ~15 days to keep up to date
-            tail_start = (df.index.max() - pd.Timedelta(days=20)).strftime("%Y-%m-%d")
-            newer = fetch_binance_histoday(sym, start=tail_start, quote=quote)
-            if not newer.empty:
-                df = df.combine_first(newer).sort_index()
-            df.to_parquet(path)
-            return df[df.index >= pd.to_datetime(start)]
-        except Exception:
-            pass
-    # no cache
-    df = fetch_binance_histoday(sym, start=start, quote=quote)
-    if not df.empty:
-        df.to_parquet(path)
-    return df
-
-# ---------- CRYPTOCOMPARE (fallback) ----------
+# ------------------------------ CryptoCompare fetch (cached) ------------------------------
 def cc_headers():
     k = os.getenv("CRYPTOCOMPARE_API_KEY", "").strip() or DEFAULT_CRYPTOCOMPARE_API_KEY.strip()
-    if not k: raise RuntimeError("CRYPTOCOMPARE_API_KEY missing.")
+    if not k: raise RuntimeError("CRYPTOCOMPARE_API_KEY missing (env or embedded).")
     return {"authorization": f"Apikey {k}"}
 
 def _is_no_market(j) -> bool:
     msg = (j or {}).get("Message","").lower()
     return any(k in msg for k in ["market does not exist","pair not found","there is no data"])
+
+def _cache_path(sym, tsym, ex):
+    tag = (ex or "CCCAGG").lower()
+    return os.path.join(CACHE_DIR, f"{sym}_{tsym}_{tag}.parquet")
 
 def cc_histoday_page_with(sym, tsym="USD", exchange=None, limit=2000, toTs=None):
     url = "https://min-api.cryptocompare.com/data/v2/histoday"
@@ -180,7 +101,7 @@ def cc_histoday_page_with(sym, tsym="USD", exchange=None, limit=2000, toTs=None)
                     wait = min(WAIT_CAP, BASE_SLEEP*(2**k) + random.uniform(0,0.6))
                     log(f"CC rate limit {sym}-{tsym}@{exchange or 'CCCAGG'}; sleep {wait:.1f}s"); time.sleep(wait); continue
                 if _is_no_market(data): return None
-                last_err = RuntimeError(msg or "CC error")
+                last_err = RuntimeError(msg or "Unknown CC error")
                 wait = min(WAIT_CAP, BASE_SLEEP*(2**k) + random.uniform(0,0.6))
                 log(f"CC bad resp {sym}-{tsym}@{exchange}: {last_err} (retry {k+1}/{MAX_RETRIES}, {wait:.1f}s)")
                 time.sleep(wait); continue
@@ -214,43 +135,34 @@ def cc_histoday_full_with(sym, tsym="USD", exchange=None, start="2020-01-01"):
         time.sleep(0.06)
     return df[df.index >= pd.to_datetime(start)]
 
-def get_ohlcv_cc_cached(sym, start="2021-01-01", tsym="USD", exchange=None):
-    path = _cache_path("cc", sym, tsym, (exchange or "CCCAGG"))
-    if os.path.exists(path):
-        try:
-            df = pd.read_parquet(path)
-            # top up ~15 latest days
-            newer = cc_histoday_page_with(sym, tsym=tsym, exchange=exchange, limit=15)
-            if isinstance(newer, pd.DataFrame) and not newer.empty:
-                df = df.combine_first(newer).sort_index()
-            df.to_parquet(path)
-            return df[df.index >= pd.to_datetime(start)]
-        except Exception:
-            pass
-    df = cc_histoday_full_with(sym, tsym=tsym, exchange=exchange, start=start)
-    if not df.empty:
-        df.to_parquet(path)
-    return df
-
-# ---------- Unified fetch (Binance first, CC fallback) ----------
-def get_ohlcv(symbol, start="2021-01-01"):
-    # Try Binance *USDT*
-    df = get_ohlcv_binance_cached(symbol, start=start, quote="USDT")
-    if df is not None and not df.empty:
-        return df
-    # Fallback to CryptoCompare (USD then USDT across popular exchanges)
+def get_ohlcv_cc_cached(sym, start="2021-01-01"):
+    # Try caches in priority order (USD on large exchanges first, then USDT, then CCCAGG)
     for tsym in ("USD","USDT"):
         for ex in ("BINANCE","BYBIT","OKX","KUCOIN","BITGET","GATEIO","KRAKEN","COINBASE", None):
-            try:
-                df = get_ohlcv_cc_cached(symbol, start=start, tsym=tsym, exchange=ex)
-                if df is not None and not df.empty:
-                    return df
-            except Exception:
-                continue
-    log(f"UNSUPPORTED everywhere: {symbol}")
+            path = _cache_path(sym, tsym, ex)
+            if os.path.exists(path):
+                try:
+                    df = pd.read_parquet(path)
+                    # Top up last ~15 days to stay current
+                    newer = cc_histoday_page_with(sym, tsym=tsym, exchange=ex, limit=15)
+                    if isinstance(newer, pd.DataFrame) and not newer.empty:
+                        df = df.combine_first(newer).sort_index()
+                    df.to_parquet(path)
+                    return df[df.index >= pd.to_datetime(start)]
+                except Exception:
+                    pass
+            # If no cache yet, try to build it with a full fetch once
+            df_full = cc_histoday_full_with(sym, tsym=tsym, exchange=ex, start=start)
+            if df_full is not None and not df_full.empty:
+                df_full.to_parquet(path)
+                return df_full
+    log(f"UNSUPPORTED on CC: {sym} (skipping)")
     return pd.DataFrame()
 
-# ============================= INDICATORS =============================
+def get_ohlcv(symbol, start="2021-01-01"):
+    return get_ohlcv_cc_cached(symbol, start=start)
+
+# ------------------------------ Indicators ------------------------------
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
 def rsi(series, length=14):
@@ -267,7 +179,7 @@ def sharpe(r, ppy=365):
     sd = r.std(ddof=0)
     return 0.0 if sd==0 or np.isnan(sd) else (r.mean()/sd)*math.sqrt(ppy)
 
-# ============================= DATA ALIGNMENT =============================
+# ------------------------------ Alignment ------------------------------
 def load_universe(symbols, start):
     frames, failed = {}, []
     for i, sym in enumerate(symbols):
@@ -277,9 +189,10 @@ def load_universe(symbols, start):
             else: frames[sym] = df
         except Exception as e:
             failed.append(sym); log(f"FAIL {sym}: {e}")
-        if i < len(symbols)-1: time.sleep(0.15)  # tiny throttle
+        if i < len(symbols)-1:
+            time.sleep(SLEEP_BETWEEN_SYMBOLS)   # be polite to CC
     if failed: log(f"Skipped (no market / error): {failed}")
-    if not frames: raise RuntimeError("No symbols had valid markets.")
+    if not frames: raise RuntimeError("No symbols had valid markets on CryptoCompare.")
     return frames
 
 def align_panel(frames):
@@ -300,7 +213,7 @@ def align_panel(frames):
         VT.loc[df.index, sym] = df["VolumeTo"].astype(float)
     return C,H,L,V,VT
 
-# ============================= CORE HELPERS =============================
+# ------------------------------ Core helpers ------------------------------
 def exposure_from_breadth(breadth_pct, bmin=BREADTH_MIN, bfull=BREADTH_FULL):
     if bfull <= bmin: return 0.0
     x = (breadth_pct - bmin) / (bfull - bmin)
@@ -336,7 +249,7 @@ def compute_score_parts(idx, df_day):
     score = sum(parts[k]*w[k] for k in w) * 100.0
     return score
 
-# ============================= SCREENER (today) =============================
+# ------------------------------ Screener ------------------------------
 def build_table_today(C,H,L,V,VT):
     ret1 = C.pct_change()
     r3  = C.pct_change(3);  r7  = C.pct_change(7);  r14 = C.pct_change(14)
@@ -414,7 +327,7 @@ def build_table_today(C,H,L,V,VT):
              "RSI Short","RSI Med","Vol. Trend","Momentum","Sharpe 7d","EMA Diff","Close","Confidence %","Suggested Wt %"]]
     return df, meta
 
-# ============================= BACKTEST =============================
+# ------------------------------ Backtest ------------------------------
 def backtest(C,H,L,V,VT, start=None, end=None):
     ret1 = C.pct_change()
     r7  = C.pct_change(7);  r14 = C.pct_change(14);  r10 = C.pct_change(10)
@@ -471,7 +384,6 @@ def backtest(C,H,L,V,VT, start=None, end=None):
         equity.iloc[i] = equity.iloc[i-1] * (1.0 + port_ret)
 
     equity = equity.dropna()
-
     try:
         btc = get_ohlcv("BTC", start=str(dates.min().date()))["Close"].reindex(dates).ffill()
         btc_eq = btc / btc.iloc[0]
@@ -486,11 +398,10 @@ def backtest(C,H,L,V,VT, start=None, end=None):
     neg  = daily[daily<0]
     so   = (daily.mean()/neg.std(ddof=0))*math.sqrt(365) if len(neg)>0 and neg.std(ddof=0)>0 else 0.0
     mdd  = drawdown_curve(equity).min()
-
     stats = {"TotalReturn": float(total_ret), "CAGR": float(cagr), "Sharpe": float(sh), "Sortino": float(so), "MaxDD": float(mdd)}
     return equity, btc_eq, stats
 
-# ============================= HTML (styled) =============================
+# ------------------------------ HTML (styled like your screenshot) ------------------------------
 def style_table(df, meta):
     today = meta["today"]; breadth = meta["breadth"]; exposure = meta["exposure"]; alloc_sum = meta["alloc_sum"]
     caption = (
@@ -566,11 +477,7 @@ def style_table(df, meta):
     )
     return styled
 
-def save_html(styled, path):
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(styled.to_html())
-
-# ---- Table → PNG (discord)
+# ------------------------------ PNG table ------------------------------
 _C_HDR      = "#0b0b0b"; _C_BG_EVEN  = "#1b1b1b"; _C_BG_ODD   = "#202020"
 _C_TEXT     = "#dddddd"; _C_TEXT_HDR = "#ffffff"
 _C_BUY      = "#1fa971"; _C_HOLD="#dca408"; _C_SELL="#d14b41"; _C_NT="#555555"
@@ -579,8 +486,6 @@ _C_POS      = "#10361e"; _C_NEG="#3a1515"
 _C_BAR_G    = "#2fb66f"; _C_BAR_GR="#8a8a8a"
 
 def save_table_png(df, meta, path, max_rows=25):
-    if plt is None:
-        log("Matplotlib unavailable; skipping table PNG."); return
     show = df.head(max_rows).copy()
     cols = ["Rank","Token","Signal","Score","Entry %","Risk Gauge","3d Return","7d Return","14d Return",
             "RSI Short","RSI Med","Vol. Trend","Momentum","Sharpe 7d","EMA Diff","Close","Confidence %","Suggested Wt %"]
@@ -608,7 +513,7 @@ def save_table_png(df, meta, path, max_rows=25):
             cell.set_facecolor(_C_BG_EVEN if r%2==0 else _C_BG_ODD); cell.set_text_props(color=_C_TEXT)
     col_index = {name:i for i,name in enumerate(show.columns)}
 
-    # Signal
+    # Signal colors
     if "Signal" in col_index:
         ci = col_index["Signal"]
         for r in range(1, len(show)+1):
@@ -616,7 +521,7 @@ def save_table_png(df, meta, path, max_rows=25):
             cell = table[r, ci]; cell.set_facecolor({"BUY":_C_BUY,"HOLD":_C_HOLD,"SELL":_C_SELL}.get(v,_C_NT))
             cell.set_text_props(color="black", weight="bold")
 
-    # Risk Gauge
+    # Risk Gauge colors
     if "Risk Gauge" in col_index:
         ci = col_index["Risk Gauge"]
         for r in range(1, len(show)+1):
@@ -656,68 +561,51 @@ def save_table_png(df, meta, path, max_rows=25):
     plt.tight_layout(); plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
     log(f"Saved table PNG -> {os.path.abspath(path)}")
 
-# ============================= Discord upload =============================
-def discord_post(content: str, files_paths=None, username="Final Meme Boss"):
-    webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip() or DEFAULT_DISCORD_WEBHOOK.strip()
-    if not webhook:
-        log("DISCORD_WEBHOOK_URL not set; skipping Discord post."); return False
-    data = {"content": content, "username": username}
-    files = []
-    if files_paths:
-        idx = 1
-        for p in files_paths:
-            if not p or not os.path.exists(p): 
-                log(f"Discord: file missing -> {p}"); continue
-            files.append((f"file{idx}", (os.path.basename(p), open(p, "rb"), "image/png")))
-            idx += 1
-    try:
-        r = requests.post(webhook, data=data, files=files if files else None, timeout=30)
-        if files:
-            for _, (_, fh, _) in files:
-                try: fh.close()
-                except: pass
-        if r.status_code >= 400:
-            log(f"Discord error {r.status_code}: {r.text[:200]}"); return False
-        log("Posted to Discord."); return True
-    except Exception as e:
-        log(f"Discord post failed: {e}"); return False
-
-# ============================= MAIN =============================
+# ------------------------------ MAIN ------------------------------
 def main():
-    log("Downloading daily data (Binance primary, CC fallback) …")
+    log("Downloading daily data from CryptoCompare (cached) …")
     frames = load_universe(MEME_TICKERS, start=LOOKBACK_START)
     C,H,L,V,VT = align_panel(frames)
-    if C.index[-1].date() == date.today():  # drop partial candle if running before UTC close
+
+    # Drop today's partial candle if running before UTC close
+    if C.index[-1].date() == date.today():
         C = C.iloc[:-1]; H = H.iloc[:-1]; L = L.iloc[:-1]; V = V.iloc[:-1]; VT = VT.iloc[:-1]
-    coverage = C.notna().mean().mean(); log(f"Average price coverage: {coverage*100:.1f}%")
+
+    coverage = C.notna().mean().mean()
+    log(f"Average price coverage across kept symbols: {coverage*100:.1f}%")
 
     # Table
     table, meta = build_table_today(C,H,L,V,VT)
     table.to_csv(OUT_CSV, index=False)
-    styled = style_table(table, meta); 
+    styled = style_table(table, meta)
     with open(OUT_HTML, "w", encoding="utf-8") as f: f.write(styled.to_html())
     save_table_png(table, meta, OUT_TABLE_PNG, max_rows=TOP_K_DOLLAR_VOL)
 
     # Backtest + chart
-    if RUN_BACKTEST and plt is not None:
+    if RUN_BACKTEST:
         eq, btc_eq, stats = backtest(C,H,L,V,VT, start=BACKTEST_START, end=BACKTEST_END)
         plt.figure(figsize=(11,5.8))
         plt.plot(eq.index, eq.values, label="RSPS (hybrid)")
-        if btc_eq is not None: plt.plot(eq.index, btc_eq.reindex(eq.index).values, label="BTC HODL")
-        plt.yscale("log"); plt.title(f"RSPS vs BTC (log scale) — {BACKTEST_START} → {eq.index[-1].date()}")
+        if btc_eq is not None:
+            plt.plot(eq.index, btc_eq.reindex(eq.index).values, label="BTC HODL")
+        plt.yscale("log")
+        plt.title(f"RSPS vs BTC (log scale) — {BACKTEST_START} → {eq.index[-1].date()}")
         plt.xlabel("Date"); plt.ylabel("Equity (log)")
-        box = (f"Total: {stats['TotalReturn']*100:.1f}%\n"
-               f"CAGR:  {stats['CAGR']*100:.1f}%\n"
-               f"Sharpe:{stats['Sharpe']:.2f}\n"
-               f"Sort.: {stats['Sortino']:.2f}\n"
-               f"MaxDD: {stats['MaxDD']*100:.1f}%")
-        plt.legend(); plt.gcf().text(0.78, 0.50, box, fontsize=10,
-                                     bbox=dict(boxstyle="round", facecolor="#111", edgecolor="#444"),
-                                     color="#ddd")
+        box = (
+            f"Total: {stats['TotalReturn']*100:.1f}%\n"
+            f"CAGR:  {stats['CAGR']*100:.1f}%\n"
+            f"Sharpe:{stats['Sharpe']:.2f}\n"
+            f"Sort.: {stats['Sortino']:.2f}\n"
+            f"MaxDD: {stats['MaxDD']*100:.1f}%"
+        )
+        plt.legend()
+        plt.gcf().text(0.78, 0.50, box, fontsize=10,
+                       bbox=dict(boxstyle="round", facecolor="#111", edgecolor="#444"),
+                       color="#ddd")
         plt.tight_layout(); plt.savefig(OUT_PNG, dpi=150); plt.close()
         log(f"Saved chart -> {OUT_PNG}")
     else:
-        log("Backtest/chart skipped.")
+        log("Backtest skipped.")
 
     if OPEN_AFTER_SAVE:
         try: webbrowser.open(f"file://{os.path.abspath(OUT_HTML)}")
@@ -729,13 +617,9 @@ def main():
     print(table.to_string(index=False))
     print("\nSaved:", OUT_CSV, "|", OUT_HTML, "|", OUT_TABLE_PNG, "|", (OUT_PNG if RUN_BACKTEST else ""))
 
-    # Discord (one message, both images)
-    msg = f"Meme Screener — {meta['today'].date()}\nTable + equity curve."
-    attachments = [OUT_TABLE_PNG] + ([OUT_PNG] if os.path.exists(OUT_PNG) else [])
-    discord_post(msg, attachments)
-
 if __name__ == "__main__":
     main()
+
 
 
 
