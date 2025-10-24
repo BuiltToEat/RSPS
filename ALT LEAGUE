@@ -1,48 +1,58 @@
-# Meme-Coin Daily Screener — Hybrid Risk + BUY/HOLD/SELL + Backtest + Color-coded table
-# Backtest period: 2021-01-01 → today, compare vs BTC buy&hold (log chart)
-# Metrics shown: %Return, CAGR, Sharpe, Sortino, MaxDD
+# ============================= Meme-Coin Daily Screener =============================
+# Hybrid Risk + BUY/HOLD/SELL + Backtest (+ HTML + PNG Table) + Discord upload
+# Backtest: 2021-01-01 → today (compare vs BTC, log-scale)
 
 import os, time, math, random, webbrowser
-from datetime import datetime
+from datetime import datetime, date
 import numpy as np
 import pandas as pd
 import requests
 
+# Non-GUI plotting in CI
+os.environ.setdefault("MPLBACKEND", "Agg")
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+except Exception:
+    plt = None
+
 # ============================= CONFIG =============================
 MEME_TICKERS = [
-    "DOGE","SHIB","PEPE","FLOKI","BONK","WIF","BOME","POPCAT","PONKE","MEW","MYRO","MOG","WOJAK","MAGA","TURBO","AIDOGE","ELON","PORK","LADYS","KISHU","AKITA","HOGE","PEPE2",
+    "DOGE","SHIB","PEPE","FLOKI","BONK","WIF","BOME","POPCAT","PONKE","MEW","MYRO","MOG","WOJAK","MAGA",
+    "TURBO","AIDOGE","ELON","PORK","LADYS","KISHU","AKITA","HOGE","PEPE2",
     "BNB","APE","ZEC","DASH","ZEN","ALU"
 ]
 
-LOOKBACK_START   = "2021-01-01"   # pull history starting 2021 for backtest
+LOOKBACK_START   = "2021-01-01"
 TOP_K_DOLLAR_VOL = 25
 ROLL_VOL_DAYS    = 14
 
-# ---- Hybrid risk / allocation knobs ----
-ENTRY_OK_THRESHOLD = 60.0   # RISK_ON if Entry% >= this (≈ 5 of 7 checks)
-BREADTH_MIN        = 20.0   # exposure = 0% at this breadth
-BREADTH_FULL       = 50.0   # exposure = 100% at this breadth
-CONF_BLEND_ENTRY   = 0.50   # Confidence = 0.5*Entry% + 0.5*Score
-CONF_EXPONENT      = 1.25   # concentrates into strongest names
-MAX_WEIGHT_PCT     = 25.0   # per-name cap BEFORE exposure scaling
-MIN_SHOW_WEIGHT    = 0.25   # hide dust weights below this in table
+ENTRY_OK_THRESHOLD = 60.0
+BREADTH_MIN        = 20.0
+BREADTH_FULL       = 50.0
+CONF_BLEND_ENTRY   = 0.50
+CONF_EXPONENT      = 1.25
+MAX_WEIGHT_PCT     = 25.0
+MIN_SHOW_WEIGHT    = 0.25
 
-# ---- Output files ----
-OUT_HTML = "meme_screener_daily.html"
-OUT_CSV  = "meme_screener_daily.csv"
-OUT_PNG  = "meme_rsps_backtest.png"     # equity chart (log scale)
-OPEN_AFTER_SAVE = True
+OUT_HTML       = "meme_screener_daily.html"
+OUT_CSV        = "meme_screener_daily.csv"
+OUT_PNG        = "meme_rsps_backtest.png"       # equity curve
+OUT_TABLE_PNG  = "meme_screener_table.png"      # table (NEW)
+OPEN_AFTER_SAVE = (not os.getenv("CI"))
 RUN_BACKTEST    = True
 
-# Backtest window (can override; None = use all available)
 BACKTEST_START = "2021-01-01"
-BACKTEST_END   = None  # e.g., "2025-10-19"
+BACKTEST_END   = None
 
-# 🔑 CryptoCompare key (ENV overrides). Your key is embedded by request.
+# CryptoCompare
 DEFAULT_CRYPTOCOMPARE_API_KEY = "d5ddb7a7f49de4d4a8af07e98e0ebf437e7acc8bb282f12af978320486f741e7"
 
+# Discord webhook (set secret DISCORD_WEBHOOK_URL in CI; can hardcode fallback here)
+DEFAULT_DISCORD_WEBHOOK = ""  # leave empty to require env var
+
 # Robust fetching
-EXCHANGES_TRY = ["BINANCE","BYBIT","OKX","KUCOIN","BITGET","GATEIO","KRAKEN","COINBASE", None]  # None=CCCAGG
+EXCHANGES_TRY = ["BINANCE","BYBIT","OKX","KUCOIN","BITGET","GATEIO","KRAKEN","COINBASE", None]
 PAIR_CACHE = {}
 MAX_RETRIES = 6
 BASE_SLEEP  = 1.2
@@ -52,12 +62,12 @@ np.set_printoptions(suppress=True)
 pd.set_option("display.width", 180)
 pd.set_option("display.max_columns", 50)
 
-# ============================= UTILS / CRYPTOCOMPARE =============================
+# ============================= LOG/UTILS =============================
 def log(msg): print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
 def cc_headers():
     api_key = os.getenv("CRYPTOCOMPARE_API_KEY", "").strip() or DEFAULT_CRYPTOCOMPARE_API_KEY.strip()
-    if not api_key: raise RuntimeError("CRYPTOCOMPARE_API_KEY missing (env or embedded).")
+    if not api_key: raise RuntimeError("CRYPTOCOMPARE_API_KEY missing.")
     return {"authorization": f"Apikey {api_key}"}
 
 def _is_no_market(j) -> bool:
@@ -75,14 +85,14 @@ def cc_histoday_page_with(sym, tsym="USD", exchange=None, limit=2000, toTs=None)
         try:
             r = SESSION.get(url, params=params, headers=headers, timeout=30)
             if r.status_code == 429:
-                wait = BASE_SLEEP*(2**k) + random.uniform(0,0.6)
+                wait = min(6.0, BASE_SLEEP*(2**k) + random.uniform(0,0.6))
                 log(f"429 {sym}-{tsym}@{exchange or 'CCCAGG'}; sleep {wait:.1f}s"); time.sleep(wait); continue
             r.raise_for_status()
             data = r.json()
             if data.get("Response") != "Success":
                 if _is_no_market(data): return None
                 last_err = RuntimeError(data.get("Message","Unknown CC error"))
-                wait = BASE_SLEEP*(2**k) + random.uniform(0,0.6)
+                wait = min(6.0, BASE_SLEEP*(2**k) + random.uniform(0,0.6))
                 log(f"CC bad resp {sym}-{tsym}@{exchange}: {last_err} (retry {k+1}/{MAX_RETRIES}, {wait:.1f}s)")
                 time.sleep(wait); continue
             df = pd.DataFrame(data["Data"]["Data"])
@@ -95,7 +105,7 @@ def cc_histoday_page_with(sym, tsym="USD", exchange=None, limit=2000, toTs=None)
             return df
         except Exception as e:
             last_err = e
-            wait = BASE_SLEEP*(2**k) + random.uniform(0,0.6)
+            wait = min(6.0, BASE_SLEEP*(2**k) + random.uniform(0,0.6))
             log(f"CC error {sym}-{tsym}@{exchange}: {e} (retry {k+1}/{MAX_RETRIES}, {wait:.1f}s)")
             time.sleep(wait)
     raise RuntimeError(f"Failed CC histoday for {sym}-{tsym}@{exchange}: {last_err}")
@@ -181,7 +191,7 @@ def align_panel(frames):
         VT.loc[df.index, sym] = df["VolumeTo"].astype(float)
     return C,H,L,V,VT
 
-# ============================= CORE LOGIC HELPERS =============================
+# ============================= CORE HELPERS =============================
 def exposure_from_breadth(breadth_pct, bmin=BREADTH_MIN, bfull=BREADTH_FULL):
     if bfull <= bmin: return 0.0
     x = (breadth_pct - bmin) / (bfull - bmin)
@@ -230,21 +240,17 @@ def build_table_today(C,H,L,V,VT):
     dv14 = VT.rolling(ROLL_VOL_DAYS).sum()
 
     today = C.index[-1]; yday = C.index[-2] if len(C.index) >= 2 else today
-
     dv_today = dv14.loc[today].dropna().sort_values(ascending=False)
     top_syms = list(dv_today.index[:TOP_K_DOLLAR_VOL])
     if not top_syms: raise RuntimeError("No symbols have dollar-volume; check API responses.")
 
-    # Entry% today & yesterday
     _, entry_pct_today = entry_checks_for_day(today, C,H,L,V, ema20,ema50, rsi3,rsi14, r7, r10, sh7, ema_diff)
     _, entry_pct_prev  = entry_checks_for_day(yday,  C,H,L,V, ema20,ema50, rsi3,rsi14, r7, r10, sh7, ema_diff)
-
     entry_pct_today = entry_pct_today.reindex(top_syms)
     entry_pct_prev  = entry_pct_prev.reindex(top_syms)
 
     coin_risk = np.where(entry_pct_today >= ENTRY_OK_THRESHOLD, "RISK_ON", "RISK_OFF")
 
-    # Base rows
     df = pd.DataFrame(index=top_syms)
     df["Token"]      = [sym + "USDT" for sym in top_syms]
     df["3d Return"]  = r3.loc[today, top_syms].values * 100
@@ -260,12 +266,10 @@ def build_table_today(C,H,L,V,VT):
     df["Entry %"]    = entry_pct_today.values
     df["Risk Gauge"] = coin_risk
 
-    # Score & Confidence
     df["Score"] = compute_score_parts(today, df).values
     conf = CONF_BLEND_ENTRY*df["Entry %"].clip(0,100) + (1.0-CONF_BLEND_ENTRY)*df["Score"].clip(0,100)
     df["Confidence %"] = conf.values
 
-    # BUY / HOLD / SELL
     prev_pass = (entry_pct_prev >= ENTRY_OK_THRESHOLD).fillna(False)
     curr_pass = (entry_pct_today >= ENTRY_OK_THRESHOLD).fillna(False)
     signal = np.where(curr_pass & ~prev_pass, "BUY",
@@ -273,11 +277,9 @@ def build_table_today(C,H,L,V,VT):
                                np.where(~curr_pass & prev_pass, "SELL", "NO TRADE")))
     df["Signal"] = signal
 
-    # Breadth / exposure
     breadth_pct = float((df["Entry %"] >= ENTRY_OK_THRESHOLD).mean()*100.0)
     exposure = exposure_from_breadth(breadth_pct)
 
-    # Weights among eligible
     eligible = (df["Risk Gauge"] == "RISK_ON")
     raw = pd.Series(0.0, index=df.index)
     if eligible.any():
@@ -290,29 +292,22 @@ def build_table_today(C,H,L,V,VT):
     final_w = (raw * (exposure * 100.0)).where(lambda s: s >= MIN_SHOW_WEIGHT, 0.0)
     df["Suggested Wt %"] = final_w.values
 
-    # Rank and order
     df = df.sort_values(by=["Confidence %","Score","Entry %"], ascending=False)
     df.insert(0, "Rank", range(1, len(df)+1))
-    round_pct_cols = ["3d Return","7d Return","14d Return","EMA Diff","Entry %","Score","Confidence %","Suggested Wt %"]
-    df[round_pct_cols] = df[round_pct_cols].round(2)
-    df[["RSI Short","RSI Med","Sharpe 7d","Momentum","Vol. Trend","Close"]] = \
-        df[["RSI Short","RSI Med","Sharpe 7d","Momentum","Vol. Trend","Close"]].round(2)
 
-    meta = {
-        "today": today,
-        "breadth": breadth_pct,
-        "exposure": exposure,
-        "alloc_sum": float(df["Suggested Wt %"].sum())
-    }
-    # Final layout
+    pct_cols = ["3d Return","7d Return","14d Return","EMA Diff","Entry %","Score","Confidence %","Suggested Wt %"]
+    for c in pct_cols:
+        if c in df.columns: df[c] = df[c].round(2)
+    for c in ["RSI Short","RSI Med","Sharpe 7d","Momentum","Vol. Trend","Close"]:
+        if c in df.columns: df[c] = df[c].round(2)
+
+    meta = {"today": today, "breadth": breadth_pct, "exposure": exposure, "alloc_sum": float(df["Suggested Wt %"].sum())}
     df = df[["Rank","Token","Signal","Score","Entry %","Risk Gauge","3d Return","7d Return","14d Return",
              "RSI Short","RSI Med","Vol. Trend","Momentum","Sharpe 7d","EMA Diff","Close","Confidence %","Suggested Wt %"]]
     return df, meta
 
 # ============================= BACKTEST =============================
 def backtest(C,H,L,V,VT, start=None, end=None):
-    """Daily rebalance backtest using the same rules as the screener.
-       start/end are date strings like '2021-01-01' (inclusive)."""
     ret1 = C.pct_change()
     r7  = C.pct_change(7);  r14 = C.pct_change(14);  r10 = C.pct_change(10)
     rsi3  = C.apply(lambda s: rsi(s, 3));  rsi14 = C.apply(lambda s: rsi(s,14))
@@ -322,22 +317,17 @@ def backtest(C,H,L,V,VT, start=None, end=None):
     ema_diff = (C/ema50 - 1.0) * 100.0
     dv14 = VT.rolling(ROLL_VOL_DAYS).sum()
 
-    # Restrict to backtest window
     dates = C.index
     if start: dates = dates[dates >= pd.to_datetime(start)]
     if end:   dates = dates[dates <= pd.to_datetime(end)]
     if len(dates) < 30: raise RuntimeError("Backtest window too short.")
 
-    equity = pd.Series(index=dates, dtype=float)
-    equity.iloc[0] = 1.0
-
+    equity = pd.Series(index=dates, dtype=float); equity.iloc[0] = 1.0
     for i in range(1, len(dates)):
         d = dates[i]
-        # universe today
         dv_today = dv14.loc[d].dropna().sort_values(ascending=False)
         top = list(dv_today.index[:TOP_K_DOLLAR_VOL])
 
-        # day frame for score
         df_day = pd.DataFrame(index=top)
         df_day["7d Return"]  = r7.loc[d, top].values * 100
         df_day["14d Return"] = r14.loc[d, top].values * 100
@@ -347,20 +337,16 @@ def backtest(C,H,L,V,VT, start=None, end=None):
         df_day["EMA Diff"]   = ema_diff.loc[d, top].values
         df_day["Vol. Trend"] = (v7.loc[d, top] / v28.loc[d, top] - 1.0).values
 
-        # Entry% today
         _, entry_today = entry_checks_for_day(d, C,H,L,V, ema20,ema50, rsi3,rsi14, r7, r10, sh7, ema_diff)
         entry_today = entry_today.reindex(top)
         risk_on = (entry_today >= ENTRY_OK_THRESHOLD)
 
-        # breadth & exposure
         breadth = float(risk_on.mean()*100.0) if len(risk_on) else 0.0
         exposure = exposure_from_breadth(breadth)
 
-        # score + confidence
         score = compute_score_parts(d, df_day)
         confidence = CONF_BLEND_ENTRY*entry_today.clip(0,100) + (1.0-CONF_BLEND_ENTRY)*score.clip(0,100)
 
-        # weights among eligible
         w = pd.Series(0.0, index=C.columns)
         elig_conf = confidence[risk_on].dropna()
         if len(elig_conf) > 0:
@@ -371,29 +357,21 @@ def backtest(C,H,L,V,VT, start=None, end=None):
             if tot > 0: w_elig = w_elig * (100.0/tot)
             w.loc[w_elig.index] = w_elig.values
 
-        # scale by exposure -> daily target weights
-        w = (w * exposure) / 100.0  # convert to 0..1 fractions
-
-        # portfolio close-to-close return
+        w = (w * exposure) / 100.0
         r = ret1.loc[d].fillna(0.0)
         port_ret = float(np.nansum(w * r))
         equity.iloc[i] = equity.iloc[i-1] * (1.0 + port_ret)
 
     equity = equity.dropna()
 
-    # BTC buy&hold for reference over the same window
     try:
         btc = get_ohlcv("BTC", start=str(dates.min().date()))["Close"].reindex(dates).ffill()
         btc_eq = btc / btc.iloc[0]
     except Exception:
         btc_eq = None
 
-    # Stats
     daily = equity.pct_change().dropna()
-    def drawdown_curve(x):
-        peak = x.cummax()
-        return x/peak - 1.0
-
+    def drawdown_curve(x): return x/x.cummax() - 1.0
     total_ret = equity.iloc[-1] - 1.0
     cagr = (equity.iloc[-1]) ** (365.0/len(equity)) - 1.0 if len(equity)>1 else 0.0
     sh   = sharpe(daily)
@@ -401,10 +379,10 @@ def backtest(C,H,L,V,VT, start=None, end=None):
     so   = (daily.mean()/neg.std(ddof=0))*math.sqrt(365) if len(neg)>0 and neg.std(ddof=0)>0 else 0.0
     mdd  = drawdown_curve(equity).min()
 
-    stats = {"TotalReturn": total_ret, "CAGR": cagr, "Sharpe": sh, "Sortino": so, "MaxDD": mdd}
+    stats = {"TotalReturn": float(total_ret), "CAGR": float(cagr), "Sharpe": float(sh), "Sortino": float(so), "MaxDD": float(mdd)}
     return equity, btc_eq, stats
 
-# ============================= HTML (color-coded, aesthetic) =============================
+# ============================= HTML (styled) =============================
 def style_table(df, meta):
     today = meta["today"]; breadth = meta["breadth"]; exposure = meta["exposure"]; alloc_sum = meta["alloc_sum"]
     caption = (
@@ -433,12 +411,10 @@ def style_table(df, meta):
             else:          out.append("background-color:#2a0d0d; color:#ff6b6b;")
         return out
 
-    # Brighter green/red boxes for Risk Gauge
     def risk_gauge_boxes(s):
         out=[]
         for v in s.astype(str):
             if v == "RISK_ON":
-                # bright green similar to entry bar color
                 out.append("background-color:#0a0; color:#fff; font-weight:700; text-align:center; border:1px solid #0b6f0b;")
             elif v == "RISK_OFF":
                 out.append("background-color:#b00000; color:#fff; font-weight:700; text-align:center; border:1px solid #7a0000;")
@@ -446,7 +422,6 @@ def style_table(df, meta):
                 out.append("text-align:center;")
         return out
 
-    # Colored badges for Signal: BUY=green, SELL=red, HOLD=orange, NO TRADE=grey
     def signal_badges(s):
         out=[]
         for v in s.astype(str):
@@ -456,72 +431,46 @@ def style_table(df, meta):
                 out.append("background-color:#b00000; color:#fff; font-weight:700; text-align:center; border:1px solid #7a0000;")
             elif v == "HOLD":
                 out.append("background-color:#f59e0b; color:#1b1200; font-weight:700; text-align:center; border:1px solid #a86b06;")
-            else:  # NO TRADE or anything else
+            else:
                 out.append("background-color:#3a3a3a; color:#eee; text-align:center; border:1px solid #2a2a2a;")
         return out
 
-    # Keep some cells plain dark; Signal/Risk Gauge will be overridden by badge/box styles below
     plain_dark_cols = ["Rank","Token","Close"]
 
     styled = (
         df.style
-        .set_caption(caption)
-        .hide(axis="index")
-        # Bars
+        .set_caption(caption).hide(axis="index")
         .apply(lambda s: bar_0_100(s, "#0a0"), subset=["Entry %","Confidence %"])
         .apply(lambda s: bar_0_100(s, "#0aa"), subset=["Suggested Wt %"])
-        # Numeric green/red
         .apply(green_if_pos_red_if_neg, subset=["3d Return","7d Return","14d Return","Vol. Trend","Momentum","Sharpe 7d","EMA Diff"])
-        .apply(lambda s: green_if_over(s, 50), subset=["RSI Short"])
+        .apply(lambda s: green_if_over(s, 55), subset=["RSI Short"])
         .apply(lambda s: green_if_over(s, 50), subset=["RSI Med"])
-        # Base dark for some columns
         .set_properties(subset=plain_dark_cols, **{"background-color":"#0b0b0b","color":"#ddd","border-color":"#333"})
-        # Apply colored badges (ensure these come AFTER set_properties to override)
         .apply(signal_badges, subset=["Signal"])
         .apply(risk_gauge_boxes, subset=["Risk Gauge"])
-        # Score subtle shading
         .background_gradient(axis=None, cmap="Greens", subset=["Score"])
-        # Black/white header & nicer typography
         .set_table_styles([
-            {"selector":"table","props":[
-                ("background-color","#181818"),("color","#ddd"),
+            {"selector":"table","props":[("background-color","#181818"),("color","#ddd"),
                 ("border-collapse","separate"),("border-spacing","0"),
                 ("font-family","-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,'Noto Sans','Liberation Sans',sans-serif"),
-                ("font-size","13px"),("line-height","1.35"),
-                ("font-variant-numeric","tabular-nums lining-nums"),
-                ("border","1px solid #2a2a2a"),("border-radius","10px"),("overflow","hidden")
-            ]},
-            {"selector":"th","props":[
-                ("background-color","#000"),("color","#fff"),
+                ("font-size","13px"),("line-height","1.35"),("font-variant-numeric","tabular-nums lining-nums"),
+                ("border","1px solid #2a2a2a"),("border-radius","10px"),("overflow","hidden")]},
+            {"selector":"th","props":[("background-color","#000"),("color","#fff"),
                 ("text-transform","uppercase"),("letter-spacing","0.02em"),
-                ("font-weight","700"),("padding","8px 10px"),("border-bottom","1px solid #333")
-            ]},
-            {"selector":"caption","props":[
-                ("caption-side","top"),("background-color","#000"),("color","#fff"),
-                ("font-weight","600"),("font-size","14px"),("padding","10px 12px"),("text-align","left")
-            ]},
-            {"selector":"td","props":[
-                ("padding","7px 10px"),("border-bottom","1px solid #242424"),
-                ("border-right","1px solid #202020"),("vertical-align","middle")
-            ]},
+                ("font-weight","700"),("padding","8px 10px"),("border-bottom","1px solid #333")]},
+            {"selector":"caption","props":[("caption-side","top"),("background-color","#000"),("color","#fff"),
+                ("font-weight","600"),("font-size","14px"),("padding","10px 12px"),("text-align","left")]},
+            {"selector":"td","props":[("padding","7px 10px"),("border-bottom","1px solid #242424"),
+                ("border-right","1px solid #202020"),("vertical-align","middle")]},
             {"selector":"td:last-child","props":[("border-right","none")]},
         ])
         .format({
-            "Rank":"{:d}",
-            "Score":"{:.2f}",
-            "Entry %":"{:.1f}%",
-            "Confidence %":"{:.1f}%",
+            "Rank":"{:d}", "Score":"{:.2f}", "Entry %":"{:.1f}%", "Confidence %":"{:.1f}%",
             "Suggested Wt %":"{:.1f}%",
-            "3d Return":"{:+.2f}%",
-            "7d Return":"{:+.2f}%",
-            "14d Return":"{:+.2f}%",
-            "RSI Short":"{:.2f}",
-            "RSI Med":"{:.2f}",
-            "Vol. Trend":"{:+.2f}",
-            "Momentum":"{:+.2f}",
-            "Sharpe 7d":"{:.2f}",
-            "EMA Diff":"{:+.2f}%",
-            "Close":"{:.6f}"
+            "3d Return":"{:+.2f}%", "7d Return":"{:+.2f}%", "14d Return":"{:+.2f}%",
+            "RSI Short":"{:.2f}", "RSI Med":"{:.2f}",
+            "Vol. Trend":"{:+.2f}", "Momentum":"{:+.2f}", "Sharpe 7d":"{:.2f}",
+            "EMA Diff":"{:+.2f}%", "Close":"{:.6f}"
         })
     )
     return styled
@@ -529,6 +478,158 @@ def style_table(df, meta):
 def save_html(styled, path):
     with open(path, "w", encoding="utf-8") as f:
         f.write(styled.to_html())
+
+# ============================= TABLE → PNG (for Discord) =============================
+# Colors to match your screenshot
+_C_HDR      = "#0b0b0b"
+_C_BG_EVEN  = "#1b1b1b"
+_C_BG_ODD   = "#202020"
+_C_TEXT     = "#dddddd"
+_C_TEXT_HDR = "#ffffff"
+_C_BUY      = "#1fa971"; _C_HOLD = "#dca408"; _C_SELL = "#d14b41"; _C_NT = "#555555"
+_C_RON      = "#0f7d4f"; _C_ROFF = "#943233"
+_C_POS      = "#10361e"; _C_NEG  = "#3a1515"
+_C_BAR_G    = "#2fb66f"; _C_BAR_GR = "#8a8a8a"
+
+def _shade_signed(v):
+    if pd.isna(v) or float(v) == 0: return None
+    return _C_POS if float(v) > 0 else _C_NEG
+
+def save_table_png(df, meta, path, max_rows=25):
+    if plt is None:
+        log("Matplotlib unavailable; skipping table PNG.")
+        return
+    show = df.head(max_rows).copy()
+    cols = ["Rank","Token","Signal","Score","Entry %","Risk Gauge","3d Return","7d Return","14d Return",
+            "RSI Short","RSI Med","Vol. Trend","Momentum","Sharpe 7d","EMA Diff","Close","Confidence %","Suggested Wt %"]
+    cols = [c for c in cols if c in show.columns]
+    show = show[cols]
+
+    # stringify for the table widget
+    def fmt(series, spec): return series.map(lambda x: spec.format(x) if pd.notna(x) else "")
+    fmts = {"Score":"{:.1f}","Entry %":"{:.1f}","3d Return":"{:+.2f}","7d Return":"{:+.2f}",
+            "14d Return":"{:+.2f}","RSI Short":"{:.2f}","RSI Med":"{:.2f}","Vol. Trend":"{:+.2f}",
+            "Momentum":"{:+.2f}","Sharpe 7d":"{:.2f}","EMA Diff":"{:+.2f}","Close":"{:.6f}",
+            "Confidence %":"{:.1f}","Suggested Wt %":"{:.1f}"}
+    for c, spec in fmts.items():
+        if c in show.columns: show[c] = fmt(show[c], spec)
+
+    fig, ax = plt.subplots(figsize=(13.5, 0.60*len(show)+2.0))
+    ax.axis("off")
+    title = (
+        f"Meme Screener — Top {len(show)} by 14d $Volume — {meta['today'].date()}  |  "
+        f"Breadth≥{ENTRY_OK_THRESHOLD:.0f}%: {meta['breadth']:.1f}%  |  "
+        f"Exposure: {meta['exposure']*100:.0f}%  |  Total Alloc: {meta['alloc_sum']:.1f}%"
+    )
+    ax.set_title(title, fontsize=12, loc="left", pad=12, color=_C_TEXT)
+
+    table = ax.table(cellText=show.values, colLabels=show.columns, loc="center", cellLoc="center")
+    table.auto_set_font_size(False); table.set_fontsize(9); table.scale(1.0, 1.25)
+
+    # base styling
+    for (r,c), cell in table.get_celld().items():
+        if r == 0:
+            cell.set_facecolor(_C_HDR); cell.set_text_props(color=_C_TEXT_HDR, weight="bold")
+        else:
+            cell.set_facecolor(_C_BG_EVEN if r%2==0 else _C_BG_ODD)
+            cell.set_text_props(color=_C_TEXT)
+
+    col_index = {name:i for i,name in enumerate(show.columns)}
+
+    # Signal colors
+    if "Signal" in col_index:
+        ci = col_index["Signal"]
+        for r in range(1, len(show)+1):
+            v = df.loc[df["Rank"]==int(show.iloc[r-1]["Rank"]), "Signal"].values[0]
+            cell = table[r, ci]
+            cell.set_facecolor({"BUY":_C_BUY,"HOLD":_C_HOLD,"SELL":_C_SELL}.get(v,_C_NT))
+            cell.set_text_props(color="black", weight="bold")
+
+    # Risk Gauge
+    if "Risk Gauge" in col_index:
+        ci = col_index["Risk Gauge"]
+        for r in range(1, len(show)+1):
+            v = df.loc[df["Rank"]==int(show.iloc[r-1]["Rank"]), "Risk Gauge"].values[0]
+            cell = table[r, ci]
+            cell.set_facecolor(_C_RON if v=="RISK_ON" else _C_ROFF)
+            cell.set_text_props(color="white", weight="bold")
+
+    # Signed shades
+    signed = [c for c in ["3d Return","7d Return","14d Return","Vol. Trend","Momentum","Sharpe 7d","EMA Diff"] if c in col_index]
+    for sc in signed:
+        ci = col_index[sc]
+        for r in range(1, len(show)+1):
+            val = df.loc[df["Rank"]==int(show.iloc[r-1]["Rank"]), sc].values[0]
+            color = _shade_signed(val)
+            if color: table[r, ci].set_facecolor(color)
+
+    # RSI thresholds
+    if "RSI Short" in col_index:
+        ci = col_index["RSI Short"]
+        for r in range(1, len(show)+1):
+            val = df.loc[df["Rank"]==int(show.iloc[r-1]["Rank"]), "RSI Short"].values[0]
+            table[r, ci].set_facecolor(_C_POS if float(val)>=55 else _C_NEG)
+    if "RSI Med" in col_index:
+        ci = col_index["RSI Med"]
+        for r in range(1, len(show)+1):
+            val = df.loc[df["Rank"]==int(show.iloc[r-1]["Rank"]), "RSI Med"].values[0]
+            table[r, ci].set_facecolor(_C_POS if float(val)>=50 else _C_NEG)
+
+    # Bars inside cells (Confidence %, Suggested Wt %)
+    def add_bar(r, ci, pct, color):
+        cell = table[r, ci]; x, y = cell.get_x(), cell.get_y()
+        w, h = cell.get_width(), cell.get_height()
+        if pct is None: return
+        p = max(0.0, min(1.0, float(pct)/100.0))
+        rect = Rectangle((x+0.005, y+0.005), p*(w-0.01), h-0.01, transform=ax.transData,
+                         linewidth=0, facecolor=color, alpha=0.85, zorder=0.5)
+        ax.add_patch(rect)
+
+    for name,color in [("Confidence %", _C_BAR_G), ("Suggested Wt %", _C_BAR_GR)]:
+        if name in col_index:
+            ci = col_index[name]
+            for r in range(1, len(show)+1):
+                raw = df.loc[df["Rank"]==int(show.iloc[r-1]["Rank"]), name].values[0]
+                add_bar(r, ci, raw, color)
+
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    log(f"Saved table PNG -> {os.path.abspath(path)}")
+
+# ============================= Discord upload =============================
+def discord_post(content: str, files_paths=None, username="Final Meme Boss"):
+    webhook = os.getenv("DISCORD_WEBHOOK_URL", "").strip() or DEFAULT_DISCORD_WEBHOOK.strip()
+    if not webhook:
+        log("DISCORD_WEBHOOK_URL not set; skipping Discord post.")
+        return False
+
+    data = {"content": content, "username": username}
+    files = []
+    if files_paths:
+        idx = 1
+        for p in files_paths:
+            if not p or not os.path.exists(p): 
+                log(f"Discord: file missing -> {p}")
+                continue
+            files.append((f"file{idx}", (os.path.basename(p), open(p, "rb"), "image/png")))
+            idx += 1
+
+    try:
+        r = requests.post(webhook, data=data, files=files if files else None, timeout=30)
+        if files:
+            for _, (_, fh, _) in files: 
+                try: fh.close()
+                except: pass
+        if r.status_code >= 400:
+            log(f"Discord error {r.status_code}: {r.text[:200]}")
+            return False
+        log("Posted to Discord.")
+        return True
+    except Exception as e:
+        log(f"Discord post failed: {e}")
+        return False
+
 
 # ============================= MAIN =============================
 def main():
@@ -538,63 +639,66 @@ def main():
     coverage = C.notna().mean().mean()
     log(f"Average price coverage across kept symbols: {coverage*100:.1f}%")
 
-    # ---- Today table
+    # Drop today's partial candle if running before UTC close to avoid noisy today-row
+    if C.index[-1].date() == date.today():
+        C = C.iloc[:-1]; H = H.iloc[:-1]; L = L.iloc[:-1]; V = V.iloc[:-1]; VT = VT.iloc[:-1]
+
+    # ---- Table (today)
     table, meta = build_table_today(C,H,L,V,VT)
     table.to_csv(OUT_CSV, index=False)
     styled = style_table(table, meta)
     save_html(styled, OUT_HTML)
+    # NEW: PNG version of the table for Discord
+    save_table_png(table, meta, OUT_TABLE_PNG, max_rows=TOP_K_DOLLAR_VOL)
 
-    # ---- Backtest + chart (2021 -> today by default)
-    if RUN_BACKTEST:
+    # ---- Backtest + chart
+    if RUN_BACKTEST and plt is not None:
         eq, btc_eq, stats = backtest(C,H,L,V,VT, start=BACKTEST_START, end=BACKTEST_END)
-        print("\n===== BACKTEST ({} → {}) =====".format(
-            BACKTEST_START, (BACKTEST_END or str(eq.index[-1].date()))
-        ))
-        print(f"Total Return: {stats['TotalReturn']*100:.2f}%")
-        print(f"CAGR:         {stats['CAGR']*100:.2f}%")
-        print(f"Sharpe:       {stats['Sharpe']:.2f}")
-        print(f"Sortino:      {stats['Sortino']:.2f}")
-        print(f"Max Drawdown: {stats['MaxDD']*100:.2f}%")
+        plt.figure(figsize=(11,5.8))
+        plt.plot(eq.index, eq.values, label="RSPS (hybrid)")
+        if btc_eq is not None:
+            plt.plot(eq.index, btc_eq.reindex(eq.index).values, label="BTC HODL")
+        plt.yscale("log")
+        plt.title(f"RSPS vs BTC (log scale) — {BACKTEST_START} → {eq.index[-1].date()}")
+        plt.xlabel("Date"); plt.ylabel("Equity (log)")
+        box = (
+            f"Total: {stats['TotalReturn']*100:.1f}%\n"
+            f"CAGR:  {stats['CAGR']*100:.1f}%\n"
+            f"Sharpe:{stats['Sharpe']:.2f}\n"
+            f"Sort.: {stats['Sortino']:.2f}\n"
+            f"MaxDD: {stats['MaxDD']*100:.1f}%"
+        )
+        plt.legend()
+        plt.gcf().text(0.78, 0.50, box, fontsize=10,
+                       bbox=dict(boxstyle="round", facecolor="#111", edgecolor="#444"),
+                       color="#ddd")
+        plt.tight_layout()
+        plt.savefig(OUT_PNG, dpi=150)
+        plt.close()
+        log(f"Saved chart -> {OUT_PNG}")
+    else:
+        log("Backtest/chart skipped (RUN_BACKTEST=False or matplotlib unavailable).")
 
-        try:
-            import matplotlib.pyplot as plt
-            plt.figure(figsize=(11,5.8))
-            plt.plot(eq.index, eq.values, label="RSPS (hybrid)")
-            if btc_eq is not None:
-                plt.plot(eq.index, btc_eq.reindex(eq.index).values, label="BTC HODL")
-            plt.yscale("log")
-            plt.title(f"RSPS vs BTC (log scale) — {BACKTEST_START} → {eq.index[-1].date()}")
-            plt.xlabel("Date"); plt.ylabel("Equity (log)")
-
-            # Stats textbox
-            box = (
-                f"Total: {stats['TotalReturn']*100:.1f}%\n"
-                f"CAGR:  {stats['CAGR']*100:.1f}%\n"
-                f"Sharpe:{stats['Sharpe']:.2f}\n"
-                f"Sort.: {stats['Sortino']:.2f}\n"
-                f"MaxDD: {stats['MaxDD']*100:.1f}%"
-            )
-            plt.legend()
-            plt.gcf().text(0.78, 0.50, box, fontsize=10,
-                           bbox=dict(boxstyle="round", facecolor="#111", edgecolor="#444"),
-                           color="#ddd")
-            plt.tight_layout()
-            plt.savefig(OUT_PNG, dpi=150)
-            log(f"Saved chart -> {OUT_PNG}")
-        except Exception as e:
-            log(f"Chart skipped: {e} (install matplotlib)")
-
+    # ---- Open locally (not on CI)
     if OPEN_AFTER_SAVE:
         try: webbrowser.open(f"file://{os.path.abspath(OUT_HTML)}")
         except Exception as e: log(f"Could not open browser: {e}")
 
+    # ---- Console summary
     print("\n===== Meme Screener —", meta['today'].date(), "=====")
-    print(f"Breadth (Entry%≥{ENTRY_OK_THRESHOLD:.0f}%): {meta['breadth']:.1f}%  |  Exposure: {meta['exposure']*100:.0f}%  |  Total Alloc: {meta['alloc_sum']:.1f}%")
+    print(f"Breadth (Entry%≥{ENTRY_OK_THRESHOLD:.0f}%): {meta['breadth']:.1f}%  |  "
+          f"Exposure: {meta['exposure']*100:.0f}%  |  Total Alloc: {meta['alloc_sum']:.1f}%")
     print(table.to_string(index=False))
-    print("\nSaved:", OUT_CSV, "|", OUT_HTML, "|", (OUT_PNG if RUN_BACKTEST else ""))
+    print("\nSaved:", OUT_CSV, "|", OUT_HTML, "|", OUT_TABLE_PNG, "|", (OUT_PNG if RUN_BACKTEST else ""))
+
+    # ---- Discord: ONE message with BOTH images attached (Option A)
+    msg = f"Meme Screener — {meta['today'].date()}\nTable + equity curve."
+    attachments = [OUT_TABLE_PNG] + ([OUT_PNG] if os.path.exists(OUT_PNG) else [])
+    discord_post(msg, attachments)
 
 if __name__ == "__main__":
     main()
+
 
 
 
