@@ -2,8 +2,9 @@ name: Meme Screener — 2 screenshots daily (compressed)
 
 on:
   schedule:
-    - cron: "0 0 * * *"        # 00:00 UTC daily
-  workflow_dispatch: {}        # Manual Run button
+    # Run shortly after CC's daily reset to reduce throttle noise.
+    - cron: "20 00 * * *"     # 00:20 UTC daily
+  workflow_dispatch: {}
 
 jobs:
   run:
@@ -12,6 +13,7 @@ jobs:
     env:
       TZ: Australia/Sydney
       MPLBACKEND: Agg
+      PYTHONUNBUFFERED: "1"
       CRYPTOCOMPARE_API_KEY: d5ddb7a7f49de4d4a8af07e98e0ebf437e7acc8bb282f12af978320486f741e7
       DISCORD_WEBHOOK_URL: https://discord.com/api/webhooks/1429701285975949322/fS0y9EkVQtnP15CJkAQEHEdpgL5Hlk43-Ct4D9uyZjjJT2jbk9nPkETT5cbbGGDyPVqD
 
@@ -30,14 +32,30 @@ jobs:
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install numpy pandas requests matplotlib
+            # pyarrow for Parquet cache; matplotlib for charts.
+            pip install numpy pandas requests matplotlib pyarrow
           fi
           pip install "jinja2>=3.1,<4"
 
+      # ---------- Cache CC history between runs ----------
+      - name: Cache CC history
+        uses: actions/cache@v4
+        with:
+          path: .cc_cache
+          key: ${{ runner.os }}-cccache-${{ github.ref_name }}
+          restore-keys: |
+            ${{ runner.os }}-cccache-
+
+      # ---------- Run your CC-only screener ----------
       - name: Run screener (ALT LEAGUE, no extension)
         run: |
+          set -euo pipefail
           echo "Sydney: $(date)"
-          python "ALT LEAGUE" || true
+          python -V
+          echo "CC ping (best-effort):"
+          curl -sS "https://min-api.cryptocompare.com/stats" | head -c 200 || true
+          # Run the script named exactly 'ALT LEAGUE' (no extension). Quotes are critical due to the space.
+          timeout 20m python -u "./ALT LEAGUE"
 
       - name: Show repo tree (for debugging)
         run: |
@@ -48,14 +66,15 @@ jobs:
         run: |
           set -e
           mkdir -p out
-          # Try expected names
-          for f in meme_screener_daily.html meme_screener_daily.csv meme_rsps_backtest.png; do
+          # Expected names produced by the script
+          for f in meme_screener_daily.html meme_screener_daily.csv meme_rsps_backtest.png meme_screener_table.png; do
             [ -f "$f" ] && cp -f "$f" out/
           done
-          # Fallback scan
+          # Fallback scan (just in case filenames differ)
           [ ! -f out/meme_screener_daily.html ] && H=$(find . -type f -iname "*screener*.html" -print | head -n1 || true) && [ -n "$H" ] && cp -f "$H" out/meme_screener_daily.html
           [ ! -f out/meme_screener_daily.csv ]  && C=$(find . -type f -iname "*screener*.csv"  -print | head -n1 || true) && [ -n "$C" ] && cp -f "$C" out/meme_screener_daily.csv
           [ ! -f out/meme_rsps_backtest.png ]   && P=$(find . -type f -iname "*backtest*.png"   -print | head -n1 || true) && [ -n "$P" ] && cp -f "$P" out/meme_rsps_backtest.png
+          [ ! -f out/meme_screener_table.png ]  && T=$(find . -type f -iname "*table*.png"      -print | head -n1 || true) && [ -n "$T" ] && cp -f "$T" out/meme_screener_table.png
           echo "==== out/ after collect ===="; ls -lah out || true
 
       # Make JPEG screenshots and compress if needed
@@ -68,8 +87,10 @@ jobs:
 
       - name: Render table → out/table.jpg (small)
         run: |
-          if [ -f out/meme_screener_daily.html ]; then
-            # Render directly to JPEG with moderate width/quality
+          # Prefer the script's PNG table if present; otherwise render HTML.
+          if [ -f out/meme_screener_table.png ]; then
+            convert out/meme_screener_table.png -resize 1600x -strip -quality 85 out/table.jpg
+          elif [ -f out/meme_screener_daily.html ]; then
             wkhtmltoimage --width 1500 --quality 82 --format jpg \
               out/meme_screener_daily.html out/table.jpg || true
           fi
@@ -78,7 +99,6 @@ jobs:
       - name: Normalize backtest → out/backtest.jpg (small)
         run: |
           if [ -f out/meme_rsps_backtest.png ]; then
-            # Convert/resize/compress to JPEG to stay small
             convert out/meme_rsps_backtest.png -resize 1600x -strip -quality 85 out/backtest.jpg
           elif ls out/*backtest*.png 1>/dev/null 2>&1; then
             SRC="$(ls out/*backtest*.png | head -n1)"
@@ -91,15 +111,13 @@ jobs:
           shrink() {
             IMG="$1"
             [ -f "$IMG" ] || return 0
-            # bytes
-            SZ=$(stat -c%s "$IMG")
+            SZ=$(stat -c%s "$IMG")      # bytes
             LIM=$((7500*1024))
             if [ "$SZ" -le "$LIM" ]; then
               echo "$IMG size OK: $((SZ/1024)) KB"
               return 0
             fi
             echo "$IMG too big ($((SZ/1024)) KB) -> recompressing..."
-            # progressively reduce quality until under limit or floor
             Q=80
             while [ "$SZ" -gt "$LIM" ] && [ "$Q" -ge 50 ]; do
               convert "$IMG" -strip -quality $Q -resize 1600x "$IMG"
@@ -126,11 +144,7 @@ jobs:
           echo "Base response:"; cat /tmp/resp1.txt || true
 
           declare -a args
-          if [ -f out/table.jpg ]; then
-            args+=(-F "file1=@out/table.jpg;type=image/jpeg;filename=table-${SYD_DATE}.jpg")
-          elif [ -f out/meme_screener_daily.html ]; then
-            args+=(-F "file1=@out/meme_screener_daily.html;type=text/html;filename=table-${SYD_DATE}.html")
-          fi
+          [ -f out/table.jpg ] && args+=(-F "file1=@out/table.jpg;type=image/jpeg;filename=table-${SYD_DATE}.jpg")
           [ -f out/backtest.jpg ] && args+=(-F "file2=@out/backtest.jpg;type=image/jpeg;filename=backtest-${SYD_DATE}.jpg")
           [ -f out/meme_screener_daily.csv ] && args+=(-F "file3=@out/meme_screener_daily.csv;type=text/csv;filename=screener-${SYD_DATE}.csv")
 
@@ -150,6 +164,8 @@ jobs:
         with:
           name: meme-screener-${{ github.run_id }}
           path: out/
+
+
 
 
 
