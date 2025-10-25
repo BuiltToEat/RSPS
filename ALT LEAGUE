@@ -1,7 +1,8 @@
-# ============================= Meme-Coin Screener — COINGECKO (key + retry) =============================
-# File name:  ALT LEAGUE   (no extension; run with:  python "ALT LEAGUE")
-# Data:       CoinGecko (market_chart days=max interval=daily)
-# Notes:      Set env COINGECKO_API_KEY (free demo key ok). Built-in retry/backoff + polite delay.
+# ============================= Meme-Coin Screener — COINGECKO (key via query + retry) =============================
+# File name:  ALT LEAGUE   (run with:  python "ALT LEAGUE")
+# Data:       CoinGecko /coins/{id}/market_chart?vs_currency=usd&days=max&interval=daily
+# Auth:       Set env COINGECKO_API_KEY (you already added this in GitHub secrets)
+# Cache:      Optional local .cg_cache/ parquet (helpful locally; ephemeral on GH runners)
 # Outputs:    meme_screener_daily.html, meme_screener_daily.csv, meme_screener_table.png, meme_rsps_backtest.png
 
 import os, time, math, random
@@ -46,10 +47,10 @@ BACKTEST_END   = None
 SESSION   = requests.Session()
 TIMEOUT_S = 45
 
-# polite pacing between coin requests (adjust via env if needed)
-PER_REQUEST_DELAY_S = float(os.getenv("CG_DELAY_S", "1.6"))
+# polite pacing between coin requests (adjust with env CG_DELAY_S if needed)
+PER_REQUEST_DELAY_S = float(os.getenv("CG_DELAY_S", "2.2"))
 
-# Optional local cache (helps locally; GitHub runners are ephemeral)
+# Optional local cache (helps locally)
 CACHE_DIR = ".cg_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -62,6 +63,7 @@ def log(msg): print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 # -------------------------------- CoinGecko helpers --------------------------------
 CG_BASE = "https://api.coingecko.com/api/v3"
 
+# Symbol→id mapping (tweak if any symbol resolves to a different asset on CG)
 COINGECKO_IDS = {
     "BTC":"bitcoin","BNB":"binancecoin","APE":"apecoin","ZEC":"zcash","DASH":"dash","ZEN":"horizen","ALU":"altura",
     "DOGE":"dogecoin","SHIB":"shiba-inu","PEPE":"pepe","FLOKI":"floki","BONK":"bonk","WIF":"dogwifcoin","BOME":"book-of-meme",
@@ -72,43 +74,49 @@ COINGECKO_IDS = {
 
 def cg_headers():
     """
-    CoinGecko now expects an API key. Support both demo and pro header names.
-    Set env COINGECKO_API_KEY.
+    Keep headers minimal; we pass the key via query param for maximum compatibility.
     """
-    key = os.getenv("COINGECKO_API_KEY", "").strip()
-    h = {"accept":"application/json"}
-    if key:
-        # send both; server will accept whichever applies to your plan
-        h["x-cg-demo-api-key"] = key
-        h["x-cg-pro-api-key"]  = key
-    return h
+    return {"accept": "application/json"}
 
 def cg_request(url, params=None, max_retries=6):
     """
     Robust GET with exponential backoff + jitter on 429/5xx.
-    Fail fast on 401/403 (auth issues).
+    - Sends API key via query param: x_cg_demo_api_key=<KEY>
+    - On error, surfaces server message to logs to fast-diagnose issues.
     """
+    key = os.getenv("COINGECKO_API_KEY", "").strip()
+    q = dict(params or {})
+    if key:
+        q.setdefault("x_cg_demo_api_key", key)
+
     backoff = 1.5
-    for attempt in range(1, max_retries+1):
-        r = SESSION.get(url, params=params, headers=cg_headers(), timeout=TIMEOUT_S)
-        status = r.status_code
-        if status == 200:
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        r = SESSION.get(url, params=q, headers=cg_headers(), timeout=TIMEOUT_S)
+        if r.status_code == 200:
             return r
-        if status in (401,403):
-            # auth required/forbidden — tell the user clearly
-            try_msg = r.json().get("error", "")
-            raise RuntimeError(f"CoinGecko auth error ({status}). Set COINGECKO_API_KEY. {try_msg}")
-        if status in (408,425,429,500,502,503,504,520,522):
-            # backoff + jitter
-            sleep_s = backoff * (1.0 + 0.2*random.random())
-            log(f"CG {status} — retry {attempt}/{max_retries} in {sleep_s:.1f}s …")
+
+        # Try to parse error details for clearer logs
+        try:
+            detail = r.json()
+        except Exception:
+            detail = {"text": r.text[:300]}
+
+        if r.status_code in (401, 403):
+            raise RuntimeError(f"CoinGecko auth error {r.status_code}: {detail}")
+
+        if r.status_code in (408, 425, 429, 500, 502, 503, 504, 520, 522):
+            sleep_s = backoff * (1.0 + 0.25 * random.random())
+            log(f"CG {r.status_code} — retry {attempt}/{max_retries} in {sleep_s:.1f}s … {detail}")
             time.sleep(sleep_s)
             backoff *= 1.8
+            last_err = detail
             continue
-        # other statuses → raise
-        r.raise_for_status()
-    # if we exhausted retries, raise last response
-    r.raise_for_status()
+
+        # 400 or other codes → raise with context
+        raise RuntimeError(f"CoinGecko error {r.status_code}: {detail}")
+
+    raise RuntimeError(f"CoinGecko retries exhausted. Last error: {last_err}")
 
 def cg_get_id(symbol):
     if symbol in COINGECKO_IDS:
@@ -127,22 +135,27 @@ def cg_get_id(symbol):
 def cg_market_chart_df(cg_id, vs="usd"):
     """
     /coins/{id}/market_chart?vs_currency=usd&days=max&interval=daily
-    Returns daily Close + an approximate base volume derived from total_volumes.
+    Returns daily Close + approx base volume from total_volumes.
     """
     url = f"{CG_BASE}/coins/{cg_id}/market_chart"
-    r = cg_request(url, params={"vs_currency": vs, "days":"max", "interval":"daily"})
+    r = cg_request(url, params={"vs_currency": vs, "days": "max", "interval": "daily"})
     j = r.json()
     prices = j.get("prices", [])
     vols   = j.get("total_volumes", [])
     if not prices:
         return pd.DataFrame()
-    p = pd.DataFrame(prices, columns=["ts","price"])
-    v = pd.DataFrame(vols,   columns=["ts","vol"])
+
+    p = pd.DataFrame(prices, columns=["ts", "price"])
+    v = pd.DataFrame(vols,   columns=["ts", "vol"])
     df = p.merge(v, on="ts", how="left")
+
+    # CG timestamps are ms since epoch
     df["Date"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
     df = df.set_index("Date").sort_index()
     df = df.rename(columns={"price":"Close","vol":"DollarVolume"})
+    # Approximate OHLC (daily endpoint gives 1 price per day)
     df["Open"] = df["Close"]; df["High"] = df["Close"]; df["Low"] = df["Close"]
+    # Base volume ≈ DollarVolume / price
     df["VolumeFrom"] = (df["DollarVolume"] / df["Close"]).replace([np.inf,-np.inf], np.nan)
     df["VolumeTo"]   = df["DollarVolume"]
     return df[["Open","High","Low","Close","VolumeFrom","VolumeTo"]]
@@ -200,6 +213,8 @@ def sharpe(r, ppy=365):
 # -------------------------------- Alignment --------------------------------
 def load_universe(symbols, start):
     frames, failed = {}, []
+    # log whether key is present (not the value)
+    log("CG key present: " + ("YES" if os.getenv("COINGECKO_API_KEY") else "NO"))
     for sym in symbols:
         try:
             df = get_ohlcv(sym, start=start)
@@ -349,7 +364,7 @@ def build_table_today(C,H,L,V,VT):
              "RSI Short","RSI Med","Vol. Trend","Momentum","Sharpe 7d","EMA Diff","Close","Confidence %","Suggested Wt %"]]
     return df, meta
 
-# -------------------------------- Backtest (unchanged) --------------------------------
+# -------------------------------- Backtest --------------------------------
 def backtest(C,H,L,V,VT, start=None, end=None):
     ret1 = C.pct_change()
     r7  = C.pct_change(7);  r14 = C.pct_change(14);  r10 = C.pct_change(10)
@@ -407,6 +422,7 @@ def backtest(C,H,L,V,VT, start=None, end=None):
 
     equity = equity.dropna()
 
+    # Benchmark BTC via CoinGecko
     try:
         btc = get_ohlcv("BTC", start=str(dates.min().date()))["Close"].reindex(dates).ffill()
         btc_eq = btc / btc.iloc[0]
@@ -424,14 +440,170 @@ def backtest(C,H,L,V,VT, start=None, end=None):
     stats = {"TotalReturn": float(total_ret), "CAGR": float(cagr), "Sharpe": float(sh), "Sortino": float(so), "MaxDD": float(mdd)}
     return equity, btc_eq, stats
 
-# -------------------------------- Styling + PNG (unchanged) --------------------------------
-# ... (same style_table and save_table_png from your current file — unchanged for brevity) ...
+# -------------------------------- HTML + PNG table --------------------------------
+def style_table(df, meta):
+    caption = (
+        f"Meme Screener — Top {len(df)} by 14d $Volume — {meta['today'].date()}  |  "
+        f"Breadth(Entry≥{ENTRY_OK_THRESHOLD:.0f}%)={meta['breadth']:.1f}%  |  "
+        f"Exposure Scale={meta['exposure']*100:.0f}%  |  Total Alloc={meta['alloc_sum']:.1f}%"
+    )
+    def bar_0_100(s, color="#0a0"):
+        v = s.astype(float)/100.0
+        return [f"background:linear-gradient(90deg,{color} {int(100*x)}%,#222 {int(100*x)}%); color:#ddd;" for x in v]
+    def green_if_pos_red_if_neg(s):
+        out=[]
+        for x in s.astype(float):
+            if np.isnan(x): out.append("")
+            elif x > 0: out.append("background-color:#0a260a; color:#00d000;")
+            else:       out.append("background-color:#2a0d0d; color:#ff6b6b;")
+        return out
+    def green_if_over(s, thr):
+        out=[]
+        for x in s.astype(float):
+            if np.isnan(x): out.append("")
+            elif x > thr:  out.append("background-color:#0a260a; color:#00d000;")
+            else:          out.append("background-color:#2a0d0d; color:#ff6b6b;")
+        return out
+    def risk_gauge_boxes(s):
+        out=[]
+        for v in s.astype(str):
+            if v == "RISK_ON": out.append("background-color:#0a0; color:#fff; font-weight:700; text-align:center; border:1px solid #0b6f0b;")
+            elif v == "RISK_OFF": out.append("background-color:#b00000; color:#fff; font-weight:700; text-align:center; border:1px solid #7a0000;")
+            else: out.append("text-align:center;")
+        return out
+    def signal_badges(s):
+        out=[]
+        for v in s.astype(str):
+            if v == "BUY": out.append("background-color:#0a0; color:#fff; font-weight:700; text-align:center; border:1px solid #0b6f0b;")
+            elif v == "SELL": out.append("background-color:#b00000; color:#fff; font-weight:700; text-align:center; border:1px solid #7a0000;")
+            elif v == "HOLD": out.append("background-color:#f59e0b; color:#1b1200; font-weight:700; text-align:center; border:1px solid #a86b06;")
+            else: out.append("background-color:#3a3a3a; color:#eee; text-align:center; border:1px solid #2a2a2a;")
+        return out
 
-# ---------- Paste your existing style_table(...) and save_table_png(...) blocks here unchanged ----------
+    return (
+        df.style.set_caption(caption).hide(axis="index")
+        .apply(lambda s: bar_0_100(s, "#0a0"), subset=["Entry %","Confidence %"])
+        .apply(lambda s: bar_0_100(s, "#0aa"), subset=["Suggested Wt %"])
+        .apply(green_if_pos_red_if_neg, subset=["3d Return","7d Return","14d Return","Vol. Trend","Momentum","Sharpe 7d","EMA Diff"])
+        .apply(lambda s: green_if_over(s, 55), subset=["RSI Short"])
+        .apply(lambda s: green_if_over(s, 50), subset=["RSI Med"])
+        .apply(signal_badges, subset=["Signal"])
+        .apply(risk_gauge_boxes, subset=["Risk Gauge"])
+        .background_gradient(axis=None, cmap="Greens", subset=["Score"])
+        .set_table_styles([
+            {"selector":"table","props":[("background-color","#181818"),("color","#ddd"),
+                ("border-collapse","separate"),("border-spacing","0"),
+                ("font-family","-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,'Noto Sans','Liberation Sans',sans-serif"),
+                ("font-size","13px"),("line-height","1.35"),("font-variant-numeric","tabular-nums lining-nums"),
+                ("border","1px solid #2a2a2a"),("border-radius","10px"),("overflow","hidden")]},
+            {"selector":"th","props":[("background-color","#000"),("color","#fff"),
+                ("text-transform","uppercase"),("letter-spacing","0.02em"),
+                ("font-weight","700"),("padding","8px 10px"),("border-bottom","1px solid #333")]},
+            {"selector":"caption","props":[("caption-side","top"),("background-color","#000"),("color","#fff"),
+                ("font-weight","600"),("font-size","14px"),("padding","10px 12px"),("text-align","left")]},
+            {"selector":"td","props":[("padding","7px 10px"),("border-bottom","1px solid #242424"),
+                ("border-right","1px solid #202020"),("vertical-align","middle")]},
+            {"selector":"td:last-child","props":[("border-right","none")]},
+        ])
+        .format({
+            "Rank":"{:d}",
+            "Score":"{:.2f}",
+            "Entry %":"{:.1f}%",
+            "Confidence %":"{:.1f}%",
+            "Suggested Wt %":"{:.1f}%",
+            "3d Return":"{:+.2f}%",
+            "7d Return":"{:+.2f}%",
+            "14d Return":"{:+.2f}%",
+            "RSI Short":"{:.2f}",
+            "RSI Med":"{:.2f}",
+            "Vol. Trend":"{:+.2f}",
+            "Momentum":"{:+.2f}",
+            "Sharpe 7d":"{:.2f}",
+            "EMA Diff":"{:+.2f}%",
+            "Close":"{:.6f}"
+        })
+    )
+
+# PNG table (same look)
+_C_HDR      = "#0b0b0b"; _C_BG_EVEN  = "#1b1b1b"; _C_BG_ODD   = "#202020"
+_C_TEXT     = "#dddddd"; _C_TEXT_HDR = "#ffffff"
+_C_BUY      = "#1fa971"; _C_HOLD="#dca408"; _C_SELL="#d14b41"; _C_NT="#555555"
+_C_RON      = "#0f7d4f"; _C_ROFF="#943233"
+_C_POS      = "#10361e"; _C_NEG="#3a1515"
+_C_BAR_G    = "#2fb66f"; _C_BAR_GR="#8a8a8a"
+
+def save_table_png(df, meta, path, max_rows=25):
+    show = df.head(max_rows).copy()
+    cols = ["Rank","Token","Signal","Score","Entry %","Risk Gauge","3d Return","7d Return","14d Return",
+            "RSI Short","RSI Med","Vol. Trend","Momentum","Sharpe 7d","EMA Diff","Close","Confidence %","Suggested Wt %"]
+    cols = [c for c in cols if c in show.columns]; show = show[cols]
+    def fmt(series, spec): return series.map(lambda x: spec.format(x) if pd.notna(x) else "")
+    fmts = {"Score":"{:.1f}","Entry %":"{:.1f}","3d Return":"{:+.2f}","7d Return":"{:+.2f}",
+            "14d Return":"{:+.2f}","RSI Short":"{:.2f}","RSI Med":"{:.2f}","Vol. Trend":"{:+.2f}",
+            "Momentum":"{:+.2f}","Sharpe 7d":"{:.2f}","EMA Diff":"{:+.2f}","Close":"{:.6f}",
+            "Confidence %":"{:.1f}","Suggested Wt %":"{:.1f}"}
+    for c, spec in fmts.items():
+        if c in show.columns: show[c] = fmt(show[c], spec)
+
+    fig, ax = plt.subplots(figsize=(13.5, 0.62*len(show)+2.0)); ax.axis("off")
+    title = (f"Meme Screener — Top {len(show)} by 14d $Volume — {meta['today'].date()}  |  "
+             f"Breadth≥{ENTRY_OK_THRESHOLD:.0f}%: {meta['breadth']:.1f}%  |  "
+             f"Exposure: {meta['exposure']*100:.0f}%  |  Total Alloc: {meta['alloc_sum']:.1f}%")
+    ax.set_title(title, fontsize=12, loc="left", pad=12, color=_C_TEXT)
+
+    table = ax.table(cellText=show.values, colLabels=show.columns, loc="center", cellLoc="center")
+    table.auto_set_font_size(False); table.set_fontsize(9); table.scale(1.0, 1.25)
+    for (r,c), cell in table.get_celld().items():
+        if r == 0:
+            cell.set_facecolor(_C_HDR); cell.set_text_props(color=_C_TEXT_HDR, weight="bold")
+        else:
+            cell.set_facecolor(_C_BG_EVEN if r%2==0 else _C_BG_ODD); cell.set_text_props(color=_C_TEXT)
+
+    col_index = {name:i for i,name in enumerate(show.columns)}
+    if "Signal" in col_index:
+        ci = col_index["Signal"]
+        for r in range(1, len(show)+1):
+            v = show.iloc[r-1]["Signal"]
+            cell = table[r, ci]; cell.set_facecolor({"BUY":_C_BUY,"HOLD":_C_HOLD,"SELL":_C_SELL}.get(v,_C_NT))
+            cell.set_text_props(color="black", weight="bold")
+    if "Risk Gauge" in col_index:
+        ci = col_index["Risk Gauge"]
+        for r in range(1, len(show)+1):
+            v = show.iloc[r-1]["Risk Gauge"]
+            cell = table[r, ci]; cell.set_facecolor(_C_RON if v=="RISK_ON" else _C_ROFF); cell.set_text_props(color="white", weight="bold")
+
+    for sc in [c for c in ["3d Return","7d Return","14d Return","Vol. Trend","Momentum","Sharpe 7d","EMA Diff"] if c in col_index]:
+        ci = col_index[sc]
+        for r in range(1, len(show)+1):
+            try: val = float(show.iloc[r-1][sc])
+            except: val = np.nan
+            if not np.isnan(val): table[r, ci].set_facecolor(_C_POS if val>0 else _C_NEG)
+    for name,thr in [("RSI Short",55),("RSI Med",50)]:
+        if name in col_index:
+            ci = col_index[name]
+            for r in range(1, len(show)+1):
+                try: val = float(show.iloc[r-1][name])
+                except: val = np.nan
+                if not np.isnan(val): table[r, ci].set_facecolor(_C_POS if val>=thr else _C_NEG)
+
+    def add_bar(r, ci, pct, color):
+        cell = table[r, ci]; x, y = cell.get_x(), cell.get_y(); w, h = cell.get_width(), cell.get_height()
+        try: p = max(0.0, min(1.0, float(pct)/100.0))
+        except: p = 0.0
+        rect = Rectangle((x+0.005, y+0.005), p*(w-0.01), h-0.01, transform=ax.transData, linewidth=0, facecolor=color, alpha=0.85, zorder=0.5)
+        ax.add_patch(rect)
+    for name,color in [("Confidence %", _C_BAR_G), ("Suggested Wt %", _C_BAR_GR)]:
+        if name in col_index:
+            ci = col_index[name]
+            for r in range(1, len(show)+1):
+                add_bar(r, ci, show.iloc[r-1][name], color)
+
+    plt.tight_layout(); plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
+    log(f"Saved table PNG -> {os.path.abspath(path)}")
 
 # -------------------------------- MAIN --------------------------------
 def main():
-    log("Downloading daily data from CoinGecko (key + retry) …")
+    log("Downloading daily data from CoinGecko (key via query + retry) …")
     frames = load_universe(MEME_TICKERS, start=LOOKBACK_START)
     C,H,L,V,VT = align_panel(frames)
 
@@ -445,9 +617,7 @@ def main():
     # Table
     table, meta = build_table_today(C,H,L,V,VT)
     table.to_csv(OUT_CSV, index=False)
-
-    # --- render styled HTML + PNG
-    styled = style_table(table, meta)  # uses your existing function
+    styled = style_table(table, meta)
     with open(OUT_HTML, "w", encoding="utf-8") as f: f.write(styled.to_html())
     save_table_png(table, meta, OUT_TABLE_PNG, max_rows=TOP_K_DOLLAR_VOL)
 
@@ -484,6 +654,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
