@@ -3,9 +3,9 @@
 # Data:       CryptoCompare ONLY (CCCAGG aggregate). One API call per coin (uses allData=true).
 # Cache:      Optional local .cc_cache/ parquet (helps locally; on GitHub runners it's ephemeral).
 # Outputs:    meme_screener_daily.html, meme_screener_daily.csv, meme_screener_table.png, meme_rsps_backtest.png
-# Env:        (not needed anymore; API key is hardcoded per your request)
+# Posting:    Posts table+backtest PNGs to Discord via hard-coded webhook.
 
-import os, time, math, random, webbrowser
+import os, time, math, random
 from datetime import datetime, date
 import numpy as np
 import pandas as pd
@@ -14,6 +14,10 @@ import requests
 os.environ.setdefault("MPLBACKEND", "Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
+
+# -------------------------------- HARD-CODED SECRETS (per request) --------------------------------
+CRYPTOCOMPARE_API_KEY = "c7932923a3058aa813332cdb3829b67e4a47998c6bdcf7adfac40d6a0f86c417"
+DISCORD_WEBHOOK = "https://canary.discord.com/api/webhooks/1429701285975949322/fS0y9EkVQtnP15CJkAQEHEdpgL5Hlk43-Ct4D9uyZjjJT2jbk9nPkETT5cbbGGDyPVqD"
 
 # -------------------------------- CONFIG --------------------------------
 MEME_TICKERS = [
@@ -60,8 +64,7 @@ def log(msg): print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 # -------------------------------- CryptoCompare fetch (one call / coin) --------------------------------
 def cc_headers():
     # HARD-CODED per your request:
-    # WARNING: if this repo is public, anyone can see/use this key.
-    return {"authorization": "Apikey c7932923a3058aa813332cdb3829b67e4a47998c6bdcf7adfac40d6a0f86c417"}
+    return {"authorization": f"Apikey {CRYPTOCOMPARE_API_KEY}"}
 
 def _cache_path(sym, tsym="USD"):
     return os.path.join(CACHE_DIR, f"{sym}_{tsym}_cccagg.parquet")
@@ -143,7 +146,7 @@ def load_universe(symbols, start):
             else: frames[sym] = df
         except Exception as e:
             failed.append(sym); log(f"FAIL {sym}: {e}")
-        # tiny polite delay
+        # polite delay not really needed now (one call per coin), but keep tiny sleep
         time.sleep(0.05)
     if failed: log(f"Skipped (no market / error): {failed}")
     if not frames: raise RuntimeError("No symbols had valid markets on CryptoCompare.")
@@ -519,6 +522,21 @@ def save_table_png(df, meta, path, max_rows=25):
     plt.tight_layout(); plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
     log(f"Saved table PNG -> {os.path.abspath(path)}")
 
+# -------------------------------- Discord posting --------------------------------
+def post_to_discord(file_path, webhook=DISCORD_WEBHOOK):
+    try:
+        if not webhook:
+            log("Discord webhook not set; skipping post.")
+            return
+        if not os.path.exists(file_path):
+            log(f"Discord post skipped (missing): {file_path}")
+            return
+        with open(file_path, "rb") as f:
+            r = requests.post(webhook, files={"file": (os.path.basename(file_path), f, "image/png")}, timeout=30)
+        log(f"Discord post {os.path.basename(file_path)} -> {r.status_code}")
+    except Exception as e:
+        log(f"Discord post failed for {file_path}: {e}")
+
 # -------------------------------- MAIN --------------------------------
 def main():
     log("Downloading daily data from CryptoCompare (CCCAGG, allData=true) …")
@@ -570,8 +588,14 @@ def main():
     print(table.to_string(index=False))
     print("\nSaved:", OUT_CSV, "|", OUT_HTML, "|", OUT_TABLE_PNG, "|", (OUT_BACKTEST_PNG if RUN_BACKTEST else ""))
 
+    # --- Post to Discord ---
+    post_to_discord(OUT_TABLE_PNG)
+    if RUN_BACKTEST:
+        post_to_discord(OUT_BACKTEST_PNG)
+
 if __name__ == "__main__":
     main()
+
 
 
 
