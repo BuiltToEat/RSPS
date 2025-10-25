@@ -1,8 +1,9 @@
-# ============================= Meme-Coin Screener — CC ONLY (CCCAGG) =============================
-# File name:  ALT LEAGUE   (no extension; invoke with:  python "ALT LEAGUE")
-# Behavior:   Daily table + backtest, using CryptoCompare's CCCAGG only (no per-exchange requests)
+# ============================= Meme-Coin Screener — CC ONLY (once/day, low calls) =============================
+# File name:  ALT LEAGUE   (no extension; run with:  python "ALT LEAGUE")
+# Data:       CryptoCompare ONLY (CCCAGG aggregate). One API call per coin (uses allData=true).
+# Cache:      Optional local .cc_cache/ parquet (helps locally; on GitHub runners it's ephemeral).
 # Outputs:    meme_screener_daily.html, meme_screener_daily.csv, meme_screener_table.png, meme_rsps_backtest.png
-# Notes:      Requires env CRYPTOCOMPARE_API_KEY. Uses .cc_cache/ to avoid excess API calls.
+# Env:        CRYPTOCOMPARE_API_KEY must be set (your workflow already does this).
 
 import os, time, math, random, webbrowser
 from datetime import datetime, date
@@ -10,23 +11,21 @@ import numpy as np
 import pandas as pd
 import requests
 
-# Use a non-interactive backend for CI rendering
 os.environ.setdefault("MPLBACKEND", "Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
-# ------------------------------ CONFIG ------------------------------
+# -------------------------------- CONFIG --------------------------------
 MEME_TICKERS = [
     "DOGE","SHIB","PEPE","FLOKI","BONK","WIF","BOME","POPCAT","PONKE","MEW","MYRO","MOG",
     "WOJAK","MAGA","TURBO","AIDOGE","ELON","PORK","LADYS","KISHU","AKITA","HOGE","PEPE2",
     "BNB","APE","ZEC","DASH","ZEN","ALU"
 ]
 
-LOOKBACK_START   = "2021-01-01"    # full history from 2021 for backtest
+LOOKBACK_START   = "2021-01-01"
 TOP_K_DOLLAR_VOL = 25
 ROLL_VOL_DAYS    = 14
 
-# Hybrid risk / allocation knobs (unchanged)
 ENTRY_OK_THRESHOLD = 60.0
 BREADTH_MIN        = 20.0
 BREADTH_FULL       = 50.0
@@ -35,29 +34,20 @@ CONF_EXPONENT      = 1.25
 MAX_WEIGHT_PCT     = 25.0
 MIN_SHOW_WEIGHT    = 0.25
 
-# Outputs (same names + new table PNG)
 OUT_HTML         = "meme_screener_daily.html"
 OUT_CSV          = "meme_screener_daily.csv"
-OUT_TABLE_PNG    = "meme_screener_table.png"   # direct PNG table
-OUT_BACKTEST_PNG = "meme_rsps_backtest.png"    # backtest (log equity)
-OPEN_AFTER_SAVE  = False                        # CI posts to Discord
+OUT_TABLE_PNG    = "meme_screener_table.png"
+OUT_BACKTEST_PNG = "meme_rsps_backtest.png"
+OPEN_AFTER_SAVE  = False
+RUN_BACKTEST     = True
 
-# Backtest window
 BACKTEST_START = "2021-01-01"
 BACKTEST_END   = None
 
-# ----- CryptoCompare only -----
 SESSION     = requests.Session()
-MAX_RETRIES = 3
-BASE_SLEEP  = 0.6
-WAIT_CAP    = 5.0
-SLEEP_BETWEEN_SYMBOLS = 0.5
+TIMEOUT_S   = 30
 
-# ----- Force CCCAGG only (composite feed) -----
-FORCE_CCCAGG = True
-EXCHANGES_TRY = [None]  # only CCCAGG
-
-# ----- Caching -----
+# Optional local cache (helps on your laptop)
 CACHE_DIR = ".cc_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -67,125 +57,67 @@ pd.set_option("display.max_columns", 50)
 
 def log(msg): print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
-# ------------------------------ CryptoCompare fetch (cached, CCCAGG only) ------------------------------
+# -------------------------------- CryptoCompare fetch (one call / coin) --------------------------------
 def cc_headers():
     key = os.getenv("CRYPTOCOMPARE_API_KEY", "").strip()
     if not key:
-        raise RuntimeError("CRYPTOCOMPARE_API_KEY missing. Set it in environment or GitHub secrets.")
+        raise RuntimeError("CRYPTOCOMPARE_API_KEY missing. Add it to your env or workflow.")
     return {"authorization": f"Apikey {key}"}
 
-def _is_no_market(j) -> bool:
-    msg = (j or {}).get("Message","").lower()
-    return any(k in msg for k in ["market does not exist","pair not found","there is no data"])
-
-def _cache_path(sym, tsym):
-    # always CCCAGG
+def _cache_path(sym, tsym="USD"):
     return os.path.join(CACHE_DIR, f"{sym}_{tsym}_cccagg.parquet")
 
-def cc_histoday_page_with(sym, tsym="USD", exchange=None, limit=2000, toTs=None):
-    # Always use CCCAGG when forced
-    if FORCE_CCCAGG:
-        exchange = None
-
+def cc_histoday_all(sym, tsym="USD"):
+    """
+    Single request for full daily history using allData=true on CCCAGG.
+    This avoids paging/loops and keeps total calls minimal.
+    """
     url = "https://min-api.cryptocompare.com/data/v2/histoday"
-    params = {"fsym": sym, "tsym": tsym, "limit": min(2000, limit)}
-    if toTs is not None:
-        params["toTs"] = int(toTs)
-    if exchange:
-        params["e"] = exchange
-
-    headers = cc_headers()
-    last_err = None
-    for k in range(MAX_RETRIES):
-        try:
-            r = SESSION.get(url, params=params, headers=headers, timeout=30)
-            if r.status_code == 429:
-                wait = min(WAIT_CAP, BASE_SLEEP*(2**k) + random.uniform(0,0.6))
-                log(f"429 {sym}-{tsym}@{exchange or 'CCCAGG'}; sleep {wait:.1f}s")
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            data = r.json()
-            if data.get("Response") != "Success":
-                msg = data.get("Message","")
-                if "rate limit" in msg.lower():
-                    wait = min(WAIT_CAP, BASE_SLEEP*(2**k) + random.uniform(0,0.6))
-                    log(f"CC rate limit {sym}-{tsym}@{exchange or 'CCCAGG'}; sleep {wait:.1f}s")
-                    time.sleep(wait)
-                    continue
-                if _is_no_market(data):
-                    return None
-                last_err = RuntimeError(msg or "Unknown CC error")
-                wait = min(WAIT_CAP, BASE_SLEEP*(2**k) + random.uniform(0,0.6))
-                log(f"CC bad resp {sym}-{tsym}@{exchange}: {last_err} (retry {k+1}/{MAX_RETRIES}, {wait:.1f}s)")
-                time.sleep(wait)
-                continue
-            df = pd.DataFrame(data["Data"]["Data"])
-            if df.empty:
-                return pd.DataFrame()
-            df["Date"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
-            df = df.set_index("Date").rename(columns={
-                "open":"Open","high":"High","low":"Low","close":"Close",
-                "volumefrom":"VolumeFrom","volumeto":"VolumeTo"
-            })
-            return df
-        except Exception as e:
-            last_err = e
-            wait = min(WAIT_CAP, BASE_SLEEP*(2**k) + random.uniform(0,0.6))
-            log(f"CC error {sym}-{tsym}@{exchange}: {e} (retry {k+1}/{MAX_RETRIES}, {wait:.1f}s)")
-            time.sleep(wait)
-    raise RuntimeError(f"Failed CC histoday for {sym}-{tsym}@{exchange}: {last_err}")
-
-def cc_histoday_full_with(sym, tsym="USD", exchange=None, start="2020-01-01"):
-    # Always CCCAGG if forced
-    if FORCE_CCCAGG:
-        exchange = None
-
-    target = pd.to_datetime(start)
-    df = cc_histoday_page_with(sym, tsym=tsym, exchange=exchange, limit=2000)
-    if df is None or df.empty:
+    params = {"fsym": sym, "tsym": tsym, "allData": "true"}   # <- key bit
+    r = SESSION.get(url, params=params, headers=cc_headers(), timeout=TIMEOUT_S)
+    if r.status_code == 429:
+        raise RuntimeError("CC 429: rate limit")
+    r.raise_for_status()
+    j = r.json()
+    if j.get("Response") != "Success":
+        raise RuntimeError(j.get("Message", "CC error"))
+    df = pd.DataFrame(j["Data"]["Data"])
+    if df.empty:
         return pd.DataFrame()
-    df = df.sort_index()
-    earliest = df.index.min()
-    while earliest > target:
-        toTs = int(earliest.timestamp()) - 86400
-        older = cc_histoday_page_with(sym, tsym=tsym, exchange=exchange, limit=2000, toTs=toTs)
-        if older is None or older.empty:
-            break
-        df = pd.concat([older, df], axis=0)
-        df = df[~df.index.duplicated(keep="first")].sort_index()
-        earliest = df.index.min()
-        time.sleep(0.06)
-    return df[df.index >= pd.to_datetime(start)]
+    df["Date"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
+    df = df.set_index("Date").rename(columns={
+        "open":"Open","high":"High","low":"Low","close":"Close",
+        "volumefrom":"VolumeFrom","volumeto":"VolumeTo"
+    })
+    return df
 
 def get_ohlcv_cc_cached(sym, start="2021-01-01"):
-    # CCCAGG cache first; then top-up
-    for tsym in ("USD","USDT"):
-        path = _cache_path(sym, tsym)
-        if os.path.exists(path):
+    # Use cache if present, otherwise fetch once and cache.
+    path = _cache_path(sym, "USD")
+    if os.path.exists(path):
+        try:
+            df = pd.read_parquet(path)
+            # light top-up of latest ~2 weeks to cover any corrections
             try:
-                df = pd.read_parquet(path)
-                newer = cc_histoday_page_with(sym, tsym=tsym, exchange=None, limit=15)
-                if isinstance(newer, pd.DataFrame) and not newer.empty:
-                    df = df.combine_first(newer).sort_index()
+                fresh = cc_histoday_all(sym, "USD").last("20D")
+                df = pd.concat([df, fresh]).sort_index()
+                df = df[~df.index.duplicated(keep="last")]
                 df.to_parquet(path)
-                return df[df.index >= pd.to_datetime(start)]
             except Exception:
                 pass
-        df_full = cc_histoday_full_with(sym, tsym=tsym, exchange=None, start=start)
-        if df_full is not None and not df_full.empty:
-            try:
-                df_full.to_parquet(path)
-            except Exception:
-                pass
-            return df_full
-    log(f"UNSUPPORTED on CC (CCCAGG): {sym} (skipping)")
-    return pd.DataFrame()
+            return df[df.index >= pd.to_datetime(start)]
+        except Exception:
+            pass
+    df = cc_histoday_all(sym, "USD")
+    if not df.empty:
+        try: df.to_parquet(path)
+        except Exception: pass
+    return df[df.index >= pd.to_datetime(start)]
 
 def get_ohlcv(symbol, start="2021-01-01"):
     return get_ohlcv_cc_cached(symbol, start=start)
 
-# ------------------------------ Indicators ------------------------------
+# -------------------------------- Indicators --------------------------------
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 
 def rsi(series, length=14):
@@ -202,7 +134,7 @@ def sharpe(r, ppy=365):
     sd = r.std(ddof=0)
     return 0.0 if sd==0 or np.isnan(sd) else (r.mean()/sd)*math.sqrt(ppy)
 
-# ------------------------------ Alignment ------------------------------
+# -------------------------------- Alignment --------------------------------
 def load_universe(symbols, start):
     frames, failed = {}, []
     for i, sym in enumerate(symbols):
@@ -212,8 +144,8 @@ def load_universe(symbols, start):
             else: frames[sym] = df
         except Exception as e:
             failed.append(sym); log(f"FAIL {sym}: {e}")
-        if i < len(symbols)-1:
-            time.sleep(SLEEP_BETWEEN_SYMBOLS)   # be polite to CC
+        # polite delay not really needed now (one call per coin), but keep tiny sleep
+        time.sleep(0.05)
     if failed: log(f"Skipped (no market / error): {failed}")
     if not frames: raise RuntimeError("No symbols had valid markets on CryptoCompare.")
     return frames
@@ -236,7 +168,7 @@ def align_panel(frames):
         VT.loc[df.index, sym] = df["VolumeTo"].astype(float)
     return C,H,L,V,VT
 
-# ------------------------------ Core helpers ------------------------------
+# -------------------------------- Core helpers --------------------------------
 def exposure_from_breadth(breadth_pct, bmin=BREADTH_MIN, bfull=BREADTH_FULL):
     if bfull <= bmin: return 0.0
     x = (breadth_pct - bmin) / (bfull - bmin)
@@ -272,7 +204,7 @@ def compute_score_parts(idx, df_day):
     score = sum(parts[k]*w[k] for k in w) * 100.0
     return score
 
-# ------------------------------ Screener ------------------------------
+# -------------------------------- Screener --------------------------------
 def build_table_today(C,H,L,V,VT):
     ret1 = C.pct_change()
     r3  = C.pct_change(3);  r7  = C.pct_change(7);  r14 = C.pct_change(14)
@@ -352,7 +284,7 @@ def build_table_today(C,H,L,V,VT):
              "RSI Short","RSI Med","Vol. Trend","Momentum","Sharpe 7d","EMA Diff","Close","Confidence %","Suggested Wt %"]]
     return df, meta
 
-# ------------------------------ Backtest ------------------------------
+# -------------------------------- Backtest --------------------------------
 def backtest(C,H,L,V,VT, start=None, end=None):
     ret1 = C.pct_change()
     r7  = C.pct_change(7);  r14 = C.pct_change(14);  r10 = C.pct_change(10)
@@ -409,6 +341,7 @@ def backtest(C,H,L,V,VT, start=None, end=None):
         equity.iloc[i] = equity.iloc[i-1] * (1.0 + port_ret)
 
     equity = equity.dropna()
+
     try:
         btc = get_ohlcv("BTC", start=str(dates.min().date()))["Close"].reindex(dates).ffill()
         btc_eq = btc / btc.iloc[0]
@@ -426,13 +359,12 @@ def backtest(C,H,L,V,VT, start=None, end=None):
     stats = {"TotalReturn": float(total_ret), "CAGR": float(cagr), "Sharpe": float(sh), "Sortino": float(so), "MaxDD": float(mdd)}
     return equity, btc_eq, stats
 
-# ------------------------------ HTML (same look), plus PNG table ------------------------------
+# -------------------------------- HTML + PNG table --------------------------------
 def style_table(df, meta):
-    today = meta["today"]; breadth = meta["breadth"]; exposure = meta["exposure"]; alloc_sum = meta["alloc_sum"]
     caption = (
-        f"Meme Screener — Top {len(df)} by 14d $Volume — {today.date()}  |  "
-        f"Breadth(Entry≥{ENTRY_OK_THRESHOLD:.0f}%)={breadth:.1f}%  |  "
-        f"Exposure Scale={exposure*100:.0f}%  |  Total Alloc={alloc_sum:.1f}%"
+        f"Meme Screener — Top {len(df)} by 14d $Volume — {meta['today'].date()}  |  "
+        f"Breadth(Entry≥{ENTRY_OK_THRESHOLD:.0f}%)={meta['breadth']:.1f}%  |  "
+        f"Exposure Scale={meta['exposure']*100:.0f}%  |  Total Alloc={meta['alloc_sum']:.1f}%"
     )
     def bar_0_100(s, color="#0a0"):
         v = s.astype(float)/100.0
@@ -467,7 +399,7 @@ def style_table(df, meta):
             else: out.append("background-color:#3a3a3a; color:#eee; text-align:center; border:1px solid #2a2a2a;")
         return out
 
-    styled = (
+    return (
         df.style.set_caption(caption).hide(axis="index")
         .apply(lambda s: bar_0_100(s, "#0a0"), subset=["Entry %","Confidence %"])
         .apply(lambda s: bar_0_100(s, "#0aa"), subset=["Suggested Wt %"])
@@ -510,9 +442,8 @@ def style_table(df, meta):
             "Close":"{:.6f}"
         })
     )
-    return styled
 
-# Direct PNG table render (dark theme, matches HTML look)
+# PNG table (same look)
 _C_HDR      = "#0b0b0b"; _C_BG_EVEN  = "#1b1b1b"; _C_BG_ODD   = "#202020"
 _C_TEXT     = "#dddddd"; _C_TEXT_HDR = "#ffffff"
 _C_BUY      = "#1fa971"; _C_HOLD="#dca408"; _C_SELL="#d14b41"; _C_NT="#555555"
@@ -546,32 +477,26 @@ def save_table_png(df, meta, path, max_rows=25):
             cell.set_facecolor(_C_HDR); cell.set_text_props(color=_C_TEXT_HDR, weight="bold")
         else:
             cell.set_facecolor(_C_BG_EVEN if r%2==0 else _C_BG_ODD); cell.set_text_props(color=_C_TEXT)
-    col_index = {name:i for i,name in enumerate(show.columns)}
 
-    # Signal colors
+    col_index = {name:i for i,name in enumerate(show.columns)}
     if "Signal" in col_index:
         ci = col_index["Signal"]
         for r in range(1, len(show)+1):
             v = show.iloc[r-1]["Signal"]
             cell = table[r, ci]; cell.set_facecolor({"BUY":_C_BUY,"HOLD":_C_HOLD,"SELL":_C_SELL}.get(v,_C_NT))
             cell.set_text_props(color="black", weight="bold")
-
-    # Risk Gauge colors
     if "Risk Gauge" in col_index:
         ci = col_index["Risk Gauge"]
         for r in range(1, len(show)+1):
             v = show.iloc[r-1]["Risk Gauge"]
             cell = table[r, ci]; cell.set_facecolor(_C_RON if v=="RISK_ON" else _C_ROFF); cell.set_text_props(color="white", weight="bold")
 
-    # Signed shading
     for sc in [c for c in ["3d Return","7d Return","14d Return","Vol. Trend","Momentum","Sharpe 7d","EMA Diff"] if c in col_index]:
         ci = col_index[sc]
         for r in range(1, len(show)+1):
             try: val = float(show.iloc[r-1][sc])
             except: val = np.nan
             if not np.isnan(val): table[r, ci].set_facecolor(_C_POS if val>0 else _C_NEG)
-
-    # RSI thresholds
     for name,thr in [("RSI Short",55),("RSI Med",50)]:
         if name in col_index:
             ci = col_index[name]
@@ -580,7 +505,6 @@ def save_table_png(df, meta, path, max_rows=25):
                 except: val = np.nan
                 if not np.isnan(val): table[r, ci].set_facecolor(_C_POS if val>=thr else _C_NEG)
 
-    # Bars for Confidence / Suggested Wt
     def add_bar(r, ci, pct, color):
         cell = table[r, ci]; x, y = cell.get_x(), cell.get_y(); w, h = cell.get_width(), cell.get_height()
         try: p = max(0.0, min(1.0, float(pct)/100.0))
@@ -596,9 +520,9 @@ def save_table_png(df, meta, path, max_rows=25):
     plt.tight_layout(); plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
     log(f"Saved table PNG -> {os.path.abspath(path)}")
 
-# ------------------------------ MAIN ------------------------------
+# -------------------------------- MAIN --------------------------------
 def main():
-    log("Downloading daily data from CryptoCompare (CCCAGG, cached) …")
+    log("Downloading daily data from CryptoCompare (CCCAGG, allData=true) …")
     frames = load_universe(MEME_TICKERS, start=LOOKBACK_START)
     C,H,L,V,VT = align_panel(frames)
 
@@ -607,7 +531,7 @@ def main():
         C = C.iloc[:-1]; H = H.iloc[:-1]; L = L.iloc[:-1]; V = V.iloc[:-1]; VT = VT.iloc[:-1]
 
     coverage = C.notna().mean().mean()
-    log(f"Average price coverage across kept symbols: {coverage*100:.1f}%")
+    log(f"Average price coverage: {coverage*100:.1f}%")
 
     # Table
     table, meta = build_table_today(C,H,L,V,VT)
@@ -616,38 +540,40 @@ def main():
     with open(OUT_HTML, "w", encoding="utf-8") as f: f.write(styled.to_html())
     save_table_png(table, meta, OUT_TABLE_PNG, max_rows=TOP_K_DOLLAR_VOL)
 
-    # Backtest + chart
-    eq, btc_eq, stats = backtest(C,H,L,V,VT, start=BACKTEST_START, end=BACKTEST_END)
-    plt.figure(figsize=(11,5.8))
-    plt.plot(eq.index, eq.values, label="RSPS (hybrid)")
-    if btc_eq is not None:
-        plt.plot(eq.index, btc_eq.reindex(eq.index).values, label="BTC HODL")
-    plt.yscale("log")
-    plt.title(f"RSPS vs BTC (log scale) — {BACKTEST_START} → {eq.index[-1].date()}")
-    plt.xlabel("Date"); plt.ylabel("Equity (log)")
-    box = (
-        f"Total: {stats['TotalReturn']*100:.1f}%\n"
-        f"CAGR:  {stats['CAGR']*100:.1f}%\n"
-        f"Sharpe:{stats['Sharpe']:.2f}\n"
-        f"Sort.: {stats['Sortino']:.2f}\n"
-        f"MaxDD: {stats['MaxDD']*100:.1f}%"
-    )
-    plt.legend()
-    plt.gcf().text(0.78, 0.50, box, fontsize=10,
-                   bbox=dict(boxstyle="round", facecolor="#111", edgecolor="#444"),
-                   color="#ddd")
-    plt.tight_layout(); plt.savefig(OUT_BACKTEST_PNG, dpi=150); plt.close()
-    log(f"Saved backtest PNG -> {os.path.abspath(OUT_BACKTEST_PNG)}")
+    # Backtest
+    if RUN_BACKTEST:
+        eq, btc_eq, stats = backtest(C,H,L,V,VT, start=BACKTEST_START, end=BACKTEST_END)
+        plt.figure(figsize=(11,5.8))
+        plt.plot(eq.index, eq.values, label="RSPS (hybrid)")
+        if btc_eq is not None:
+            plt.plot(eq.index, btc_eq.reindex(eq.index).values, label="BTC HODL")
+        plt.yscale("log")
+        plt.title(f"RSPS vs BTC (log scale) — {BACKTEST_START} → {eq.index[-1].date()}")
+        plt.xlabel("Date"); plt.ylabel("Equity (log)")
+        box = (
+            f"Total: {stats['TotalReturn']*100:.1f}%\n"
+            f"CAGR:  {stats['CAGR']*100:.1f}%\n"
+            f"Sharpe:{stats['Sharpe']:.2f}\n"
+            f"Sort.: {stats['Sortino']:.2f}\n"
+            f"MaxDD: {stats['MaxDD']*100:.1f}%"
+        )
+        plt.legend()
+        plt.gcf().text(0.78, 0.50, box, fontsize=10,
+                       bbox=dict(boxstyle="round", facecolor="#111", edgecolor="#444"),
+                       color="#ddd")
+        plt.tight_layout(); plt.savefig(OUT_BACKTEST_PNG, dpi=150); plt.close()
+        log(f"Saved backtest PNG -> {os.path.abspath(OUT_BACKTEST_PNG)}")
 
     # Console summary
     print("\n===== Meme Screener —", meta['today'].date(), "=====")
     print(f"Breadth (Entry%≥{ENTRY_OK_THRESHOLD:.0f}%): {meta['breadth']:.1f}%  |  "
           f"Exposure: {meta['exposure']*100:.0f}%  |  Total Alloc: {meta['alloc_sum']:.1f}%")
     print(table.to_string(index=False))
-    print("\nSaved:", OUT_CSV, "|", OUT_HTML, "|", OUT_TABLE_PNG, "|", OUT_BACKTEST_PNG)
+    print("\nSaved:", OUT_CSV, "|", OUT_HTML, "|", OUT_TABLE_PNG, "|", (OUT_BACKTEST_PNG if RUN_BACKTEST else ""))
 
 if __name__ == "__main__":
     main()
+
 
 
 
