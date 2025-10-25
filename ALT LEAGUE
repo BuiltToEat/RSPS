@@ -5,7 +5,7 @@
 # Outputs:    meme_screener_daily.html, meme_screener_daily.csv, meme_screener_table.png, meme_rsps_backtest.png
 # Posting:    Posts table+backtest PNGs to Discord via hard-coded webhook.
 
-import os, time, math, random
+import os, time, math
 from datetime import datetime, date
 import numpy as np
 import pandas as pd
@@ -200,7 +200,183 @@ def compute_score_parts(idx, df_day):
     score = sum(parts[k]*w[k] for k in w) * 100.0
     return score
 
-# -------------------------------- Screener --------------------------------
+# ------------------------------ HTML styled table (Styler) ------------------------------
+def style_table(df, meta):
+    caption = (
+        f"Meme Screener — Top {len(df)} by 14d $Volume — {meta['today'].date()}  |  "
+        f"Breadth(Entry≥{ENTRY_OK_THRESHOLD:.0f}%)={meta['breadth']:.1f}%  |  "
+        f"Exposure Scale={meta['exposure']*100:.0f}%  |  Total Alloc={meta['alloc_sum']:.1f}%"
+    )
+    def bar_0_100(s, color="#0a0"):
+        v = s.astype(float)/100.0
+        return [f"background:linear-gradient(90deg,{color} {int(100*x)}%,#222 {int(100*x)}%); color:#ddd;" for x in v]
+    def green_if_pos_red_if_neg(s):
+        out=[]
+        for x in s.astype(float):
+            if np.isnan(x): out.append("")
+            elif x > 0: out.append("background-color:#0a260a; color:#00d000;")
+            else:       out.append("background-color:#2a0d0d; color:#ff6b6b;")
+        return out
+    def green_if_over(s, thr):
+        out=[]
+        for x in s.astype(float):
+            if np.isnan(x): out.append("")
+            elif x > thr:  out.append("background-color:#0a260a; color:#00d000;")
+            else:          out.append("background-color:#2a0d0d; color:#ff6b6b;")
+        return out
+    def risk_gauge_boxes(s):
+        out=[]
+        for v in s.astype(str):
+            if v == "RISK_ON": out.append("background-color:#0a0; color:#fff; font-weight:700; text-align:center; border:1px solid #0b6f0b;")
+            elif v == "RISK_OFF": out.append("background-color:#b00000; color:#fff; font-weight:700; text-align:center; border:1px solid #7a0000;")
+            else: out.append("text-align:center;")
+        return out
+    def signal_badges(s):
+        out=[]
+        for v in s.astype(str):
+            if v == "BUY": out.append("background-color:#0a0; color:#fff; font-weight:700; text-align:center; border:1px solid #0b6f0b;")
+            elif v == "SELL": out.append("background-color:#b00000; color:#fff; font-weight:700; text-align:center; border:1px solid #7a0000;")
+            elif v == "HOLD": out.append("background-color:#f59e0b; color:#1b1200; font-weight:700; text-align:center; border:1px solid #a86b06;")
+            else: out.append("background-color:#3a3a3a; color:#eee; text-align:center; border:1px solid #2a2a2a;")
+        return out
+
+    return (
+        df.style.set_caption(caption).hide(axis="index")
+        .apply(lambda s: bar_0_100(s, "#0a0"), subset=["Entry %","Confidence %"])
+        .apply(lambda s: bar_0_100(s, "#0aa"), subset=["Suggested Wt %"])
+        .apply(green_if_pos_red_if_neg, subset=["3d Return","7d Return","14d Return","Vol. Trend","Momentum","Sharpe 7d","EMA Diff"])
+        .apply(lambda s: green_if_over(s, 55), subset=["RSI Short"])
+        .apply(lambda s: green_if_over(s, 50), subset=["RSI Med"])
+        .apply(signal_badges, subset=["Signal"])
+        .apply(risk_gauge_boxes, subset=["Risk Gauge"])
+        .background_gradient(axis=None, cmap="Greens", subset=["Score"])
+        .set_table_styles([
+            {"selector":"table","props":[("background-color","#181818"),("color","#ddd"),
+                ("border-collapse","separate"),("border-spacing","0"),
+                ("font-family","-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,'Noto Sans','Liberation Sans',sans-serif"),
+                ("font-size","13px"),("line-height","1.35"),("font-variant-numeric","tabular-nums lining-nums"),
+                ("border","1px solid #2a2a2a"),("border-radius","10px"),("overflow","hidden")]},
+            {"selector":"th","props":[("background-color","#000"),("color","#fff"),
+                ("text-transform","uppercase"),("letter-spacing","0.02em"),
+                ("font-weight","700"),("padding","8px 10px"),("border-bottom","1px solid #333")]},
+            {"selector":"caption","props":[("caption-side","top"),("background-color","#000"),("color","#fff"),
+                ("font-weight","600"),("font-size","14px"),("padding","10px 12px"),("text-align","left")]},
+            {"selector":"td","props":[("padding","7px 10px"),("border-bottom","1px solid "#242424"),
+                ("border-right","1px solid #202020"),("vertical-align","middle")]},
+            {"selector":"td:last-child","props":[("border-right","none")]},
+        ])
+        .format({
+            "Rank":"{:d}",
+            "Score":"{:.2f}",
+            "Entry %":"{:.1f}%",
+            "Confidence %":"{:.1f}%",
+            "Suggested Wt %":"{:.1f}%",
+            "3d Return":"{:+.2f}%",
+            "7d Return":"{:+.2f}%",
+            "14d Return":"{:+.2f}%",
+            "RSI Short":"{:.2f}",
+            "RSI Med":"{:.2f}",
+            "Vol. Trend":"{:+.2f}",
+            "Momentum":"{:+.2f}",
+            "Sharpe 7d":"{:.2f}",
+            "EMA Diff":"{:+.2f}%",
+            "Close":"{:.6f}"
+        })
+    )
+
+# ------------------------------ PNG table (must be defined BEFORE main) ------------------------------
+_C_HDR      = "#0b0b0b"; _C_BG_EVEN  = "#1b1b1b"; _C_BG_ODD   = "#202020"
+_C_TEXT     = "#dddddd"; _C_TEXT_HDR = "#ffffff"
+_C_BUY      = "#1fa971"; _C_HOLD="#dca408"; _C_SELL="#d14b41"; _C_NT="#555555"
+_C_RON      = "#0f7d4f"; _C_ROFF="#943233"
+_C_POS      = "#10361e"; _C_NEG="#3a1515"
+_C_BAR_G    = "#2fb66f"; _C_BAR_GR="#8a8a8a"
+
+def save_table_png(df, meta, path, max_rows=25):
+    show = df.head(max_rows).copy()
+    cols = ["Rank","Token","Signal","Score","Entry %","Risk Gauge","3d Return","7d Return","14d Return",
+            "RSI Short","RSI Med","Vol. Trend","Momentum","Sharpe 7d","EMA Diff","Close","Confidence %","Suggested Wt %"]
+    cols = [c for c in cols if c in show.columns]; show = show[cols]
+    def fmt(series, spec): return series.map(lambda x: spec.format(x) if pd.notna(x) else "")
+    fmts = {"Score":"{:.1f}","Entry %":"{:.1f}","3d Return":"{:+.2f}","7d Return":"{:+.2f}",
+            "14d Return":"{:+.2f}","RSI Short":"{:.2f}","RSI Med":"{:.2f}","Vol. Trend":"{:+.2f}",
+            "Momentum":"{:+.2f}","Sharpe 7d":"{:.2f}","EMA Diff":"{:+.2f}","Close":"{:.6f}",
+            "Confidence %":"{:.1f}","Suggested Wt %":"{:.1f}"}
+    for c, spec in fmts.items():
+        if c in show.columns: show[c] = fmt(show[c], spec)
+
+    fig, ax = plt.subplots(figsize=(13.5, 0.62*len(show)+2.0)); ax.axis("off")
+    title = (f"Meme Screener — Top {len(show)} by 14d $Volume — {meta['today'].date()}  |  "
+             f"Breadth≥{ENTRY_OK_THRESHOLD:.0f}%: {meta['breadth']:.1f}%  |  "
+             f"Exposure: {meta['exposure']*100:.0f}%  |  Total Alloc: {meta['alloc_sum']:.1f}%")
+    ax.set_title(title, fontsize=12, loc="left", pad=12, color=_C_TEXT)
+
+    table = ax.table(cellText=show.values, colLabels=show.columns, loc="center", cellLoc="center")
+    table.auto_set_font_size(False); table.set_fontsize(9); table.scale(1.0, 1.25)
+    for (r,c), cell in table.get_celld().items():
+        if r == 0:
+            cell.set_facecolor(_C_HDR); cell.set_text_props(color=_C_TEXT_HDR, weight="bold")
+        else:
+            cell.set_facecolor(_C_BG_EVEN if r%2==0 else _C_BG_ODD); cell.set_text_props(color=_C_TEXT)
+
+    col_index = {name:i for i,name in enumerate(show.columns)}
+    if "Signal" in col_index:
+        ci = col_index["Signal"]
+        for r in range(1, len(show)+1):
+            v = show.iloc[r-1]["Signal"]
+            cell = table[r, ci]; cell.set_facecolor({"BUY":_C_BUY,"HOLD":_C_HOLD,"SELL":_C_SELL}.get(v,_C_NT))
+            cell.set_text_props(color="black", weight="bold")
+    if "Risk Gauge" in col_index:
+        ci = col_index["Risk Gauge"]
+        for r in range(1, len(show)+1):
+            v = show.iloc[r-1]["Risk Gauge"]
+            cell = table[r, ci]; cell.set_facecolor(_C_RON if v=="RISK_ON" else _C_ROFF); cell.set_text_props(color="white", weight="bold")
+
+    for sc in [c for c in ["3d Return","7d Return","14d Return","Vol. Trend","Momentum","Sharpe 7d","EMA Diff"] if c in col_index]:
+        ci = col_index[sc]
+        for r in range(1, len(show)+1):
+            try: val = float(show.iloc[r-1][sc])
+            except: val = np.nan
+            if not np.isnan(val): table[r, ci].set_facecolor(_C_POS if val>0 else _C_NEG)
+    for name,thr in [("RSI Short",55),("RSI Med",50)]:
+        if name in col_index:
+            ci = col_index[name]
+            for r in range(1, len(show)+1):
+                try: val = float(show.iloc[r-1][name])
+                except: val = np.nan
+                if not np.isnan(val): table[r, ci].set_facecolor(_C_POS if val>=thr else _C_NEG)
+
+    def add_bar(r, ci, pct, color):
+        cell = table[r, ci]; x, y = cell.get_x(), cell.get_y(); w, h = cell.get_width(), cell.get_height()
+        try: p = max(0.0, min(1.0, float(pct)/100.0))
+        except: p = 0.0
+        rect = Rectangle((x+0.005, y+0.005), p*(w-0.01), h-0.01, transform=ax.transData, linewidth=0, facecolor=color, alpha=0.85, zorder=0.5)
+        ax.add_patch(rect)
+    for name,color in [("Confidence %", _C_BAR_G), ("Suggested Wt %", _C_BAR_GR)]:
+        if name in col_index:
+            ci = col_index[name]
+            for r in range(1, len(show)+1):
+                add_bar(r, ci, show.iloc[r-1][name], color)
+
+    plt.tight_layout(); plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
+    log(f"Saved table PNG -> {os.path.abspath(path)}")
+
+# -------------------------------- Discord posting --------------------------------
+def post_to_discord(file_path, webhook=DISCORD_WEBHOOK):
+    try:
+        if not webhook:
+            log("Discord webhook not set; skipping post.")
+            return
+        if not os.path.exists(file_path):
+            log(f"Discord post skipped (missing): {file_path}")
+            return
+        with open(file_path, "rb") as f:
+            r = requests.post(webhook, files={"file": (os.path.basename(file_path), f, "image/png")}, timeout=30)
+        log(f"Discord post {os.path.basename(file_path)} -> {r.status_code}")
+    except Exception as e:
+        log(f"Discord post failed for {file_path}: {e}")
+
+# -------------------------------- Screener core --------------------------------
 def build_table_today(C,H,L,V,VT):
     ret1 = C.pct_change()
     r3  = C.pct_change(3);  r7  = C.pct_change(7);  r14 = C.pct_change(14)
@@ -355,105 +531,6 @@ def backtest(C,H,L,V,VT, start=None, end=None):
     stats = {"TotalReturn": float(total_ret), "CAGR": float(cagr), "Sharpe": float(sh), "Sortino": float(so), "MaxDD": float(mdd)}
     return equity, btc_eq, stats
 
-# -------------------------------- HTML + PNG table --------------------------------
-def style_table(df, meta):
-    caption = (
-        f"Meme Screener — Top {len(df)} by 14d $Volume — {meta['today'].date()}  |  "
-        f"Breadth(Entry≥{ENTRY_OK_THRESHOLD:.0f}%)={meta['breadth']:.1f}%  |  "
-        f"Exposure Scale={meta['exposure']*100:.0f}%  |  Total Alloc={meta['alloc_sum']:.1f}%"
-    )
-    def bar_0_100(s, color="#0a0"):
-        v = s.astype(float)/100.0
-        return [f"background:linear-gradient(90deg,{color} {int(100*x)}%,#222 {int(100*x)}%); color:#ddd;" for x in v]
-    def green_if_pos_red_if_neg(s):
-        out=[]
-        for x in s.astype(float):
-            if np.isnan(x): out.append("")
-            elif x > 0: out.append("background-color:#0a260a; color:#00d000;")
-            else:       out.append("background-color:#2a0d0d; color:#ff6b6b;")
-        return out
-    def green_if_over(s, thr):
-        out=[]
-        for x in s.astype(float):
-            if np.isnan(x): out.append("")
-            elif x > thr:  out.append("background-color:#0a260a; color:#00d000;")
-            else:          out.append("background-color:#2a0d0d; color:#ff6b6b;")
-        return out
-    def risk_gauge_boxes(s):
-        out=[]
-        for v in s.astype(str):
-            if v == "RISK_ON": out.append("background-color:#0a0; color:#fff; font-weight:700; text-align:center; border:1px solid #0b6f0b;")
-            elif v == "RISK_OFF": out.append("background-color:#b00000; color:#fff; font-weight:700; text-align:center; border:1px solid #7a0000;")
-            else: out.append("text-align:center;")
-        return out
-    def signal_badges(s):
-        out=[]
-        for v in s.astype(str):
-            if v == "BUY": out.append("background-color:#0a0; color:#fff; font-weight:700; text-align:center; border:1px solid #0b6f0b;")
-            elif v == "SELL": out.append("background-color:#b00000; color:#fff; font-weight:700; text-align:center; border:1px solid #7a0000;")
-            elif v == "HOLD": out.append("background-color:#f59e0b; color:#1b1200; font-weight:700; text-align:center; border:1px solid #a86b06;")
-            else: out.append("background-color:#3a3a3a; color:#eee; text-align:center; border:1px solid #2a2a2a;")
-        return out
-
-    return (
-        df.style.set_caption(caption).hide(axis="index")
-        .apply(lambda s: bar_0_100(s, "#0a0"), subset=["Entry %","Confidence %"])
-        .apply(lambda s: bar_0_100(s, "#0aa"), subset=["Suggested Wt %"])
-        .apply(green_if_pos_red_if_neg, subset=["3d Return","7d Return","14d Return","Vol. Trend","Momentum","Sharpe 7d","EMA Diff"])
-        .apply(lambda s: green_if_over(s, 55), subset=["RSI Short"])
-        .apply(lambda s: green_if_over(s, 50), subset=["RSI Med"])
-        .apply(signal_badges, subset=["Signal"])
-        .apply(risk_gauge_boxes, subset=["Risk Gauge"])
-        .background_gradient(axis=None, cmap="Greens", subset=["Score"])
-        .set_table_styles([
-            {"selector":"table","props":[("background-color","#181818"),("color","#ddd"),
-                ("border-collapse","separate"),("border-spacing","0"),
-                ("font-family","-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,'Noto Sans','Liberation Sans',sans-serif"),
-                ("font-size","13px"),("line-height","1.35"),("font-variant-numeric","tabular-nums lining-nums"),
-                ("border","1px solid #2a2a2a"),("border-radius","10px"),("overflow","hidden")]},
-            {"selector":"th","props":[("background-color","#000"),("color","#fff"),
-                ("text-transform","uppercase"),("letter-spacing","0.02em"),
-                ("font-weight","700"),("padding","8px 10px"),("border-bottom","1px solid #333")]},
-            {"selector":"caption","props":[("caption-side","top"),("background-color","#000"),("color","#fff"),
-                ("font-weight","600"),("font-size","14px"),("padding","10px 12px"),("text-align","left")]},
-            {"selector":"td","props":[("padding","7px 10px"),("border-bottom","1px solid #242424"),
-                ("border-right","1px solid #202020"),("vertical-align","middle")]},
-            {"selector":"td:last-child","props":[("border-right","none")]},
-        ])
-        .format({
-            "Rank":"{:d}",
-            "Score":"{:.2f}",
-            "Entry %":"{:.1f}%",
-            "Confidence %":"{:.1f}%",
-            "Suggested Wt %":"{:.1f}%",
-            "3d Return":"{:+.2f}%",
-            "7d Return":"{:+.2f}%",
-            "14d Return":"{:+.2f}%",
-            "RSI Short":"{:.2f}",
-            "RSI Med":"{:.2f}",
-            "Vol. Trend":"{:+.2f}",
-            "Momentum":"{:+.2f}",
-            "Sharpe 7d":"{:.2f}",
-            "EMA Diff":"{:+.2f}%",
-            "Close":"{:.6f}"
-        })
-    )
-
-# -------------------------------- Discord posting --------------------------------
-def post_to_discord(file_path, webhook=DISCORD_WEBHOOK):
-    try:
-        if not webhook:
-            log("Discord webhook not set; skipping post.")
-            return
-        if not os.path.exists(file_path):
-            log(f"Discord post skipped (missing): {file_path}")
-            return
-        with open(file_path, "rb") as f:
-            r = requests.post(webhook, files={"file": (os.path.basename(file_path), f, "image/png")}, timeout=30)
-        log(f"Discord post {os.path.basename(file_path)} -> {r.status_code}")
-    except Exception as e:
-        log(f"Discord post failed for {file_path}: {e}")
-
 # -------------------------------- MAIN --------------------------------
 def main():
     log("Downloading daily data from CryptoCompare (CCCAGG, allData=true) …")
@@ -471,9 +548,9 @@ def main():
     table, meta = build_table_today(C,H,L,V,VT)
     table.to_csv(OUT_CSV, index=False)
 
-    # --- HTML: try pretty Styler; fallback to plain HTML if jinja2/styler missing ---
+    # HTML with fallback if jinja2/styler missing
     try:
-        styled = style_table(table, meta)   # requires jinja2
+        styled = style_table(table, meta)
         html_out = styled.to_html()
     except Exception as e:
         log(f"Styler unavailable ({e}); writing plain HTML table instead.")
@@ -516,13 +593,14 @@ def main():
     print(table.to_string(index=False))
     print("\nSaved:", OUT_CSV, "|", OUT_HTML, "|", OUT_TABLE_PNG, "|", (OUT_BACKTEST_PNG if RUN_BACKTEST else ""))
 
-    # --- Post to Discord ---
+    # Post to Discord
     post_to_discord(OUT_TABLE_PNG)
     if RUN_BACKTEST:
         post_to_discord(OUT_BACKTEST_PNG)
 
 if __name__ == "__main__":
     main()
+
 
 
 
