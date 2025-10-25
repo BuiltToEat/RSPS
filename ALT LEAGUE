@@ -1,11 +1,11 @@
-# ============================= Meme-Coin Screener — COINGECKO (free-tier friendly) =============================
-# File name:  ALT LEAGUE   (run with:  python "ALT LEAGUE")
-# Data:       CoinGecko /coins/{id}/market_chart?vs_currency=usd&days=<N> (N<=CG_MAX_DAYS)
-# Auth:       Set env COINGECKO_API_KEY (you already added this in GitHub secrets)
-# Cache:      .cg_cache/ parquet (helpful locally; ephemeral on GH runners)
+# ============================= Meme-Coin Screener — CC ONLY (once/day, low calls) =============================
+# File name:  ALT LEAGUE   (no extension; run with:  python "ALT LEAGUE")
+# Data:       CryptoCompare ONLY (CCCAGG aggregate). One API call per coin (uses allData=true).
+# Cache:      Optional local .cc_cache/ parquet (helps locally; on GitHub runners it's ephemeral).
 # Outputs:    meme_screener_daily.html, meme_screener_daily.csv, meme_screener_table.png, meme_rsps_backtest.png
+# Env:        (not needed anymore; API key is hardcoded per your request)
 
-import os, time, math, random
+import os, time, math, random, webbrowser
 from datetime import datetime, date
 import numpy as np
 import pandas as pd
@@ -22,7 +22,7 @@ MEME_TICKERS = [
     "BNB","APE","ZEC","DASH","ZEN","ALU"
 ]
 
-LOOKBACK_START   = "2021-01-01"   # keep your original; we'll clamp to last CG_MAX_DAYS for the API call
+LOOKBACK_START   = "2021-01-01"
 TOP_K_DOLLAR_VOL = 25
 ROLL_VOL_DAYS    = 14
 
@@ -41,20 +41,14 @@ OUT_BACKTEST_PNG = "meme_rsps_backtest.png"
 OPEN_AFTER_SAVE  = False
 RUN_BACKTEST     = True
 
-BACKTEST_START = "2021-01-01"     # keep; we'll clamp to last CG_MAX_DAYS if needed
+BACKTEST_START = "2021-01-01"
 BACKTEST_END   = None
 
-SESSION   = requests.Session()
-TIMEOUT_S = 45
+SESSION     = requests.Session()
+TIMEOUT_S   = 30
 
-# pacing (demo tier comfort zone)
-PER_REQUEST_DELAY_S = float(os.getenv("CG_DELAY_S", "2.2"))
-
-# Free-tier max days of history (CoinGecko demo = 365)
-CG_MAX_DAYS = int(os.getenv("CG_MAX_DAYS", "365"))
-
-# cache
-CACHE_DIR = ".cg_cache"
+# Optional local cache (helps on your laptop)
+CACHE_DIR = ".cc_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 np.set_printoptions(suppress=True)
@@ -63,135 +57,64 @@ pd.set_option("display.max_columns", 50)
 
 def log(msg): print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
-# -------------------------------- CoinGecko helpers --------------------------------
-CG_BASE = "https://api.coingecko.com/api/v3"
-
-COINGECKO_IDS = {
-    "BTC":"bitcoin","BNB":"binancecoin","APE":"apecoin","ZEC":"zcash","DASH":"dash","ZEN":"horizen","ALU":"altura",
-    "DOGE":"dogecoin","SHIB":"shiba-inu","PEPE":"pepe","FLOKI":"floki","BONK":"bonk","WIF":"dogwifcoin","BOME":"book-of-meme",
-    "POPCAT":"popcat","PONKE":"ponke","MEW":"cat-in-a-dogs-world","MYRO":"myro","MOG":"mog-coin","WOJAK":"wojak",
-    "MAGA":"maga","TURBO":"turbo","AIDOGE":"arbdoge-ai","ELON":"dogelon-mars","PORK":"pepefork","LADYS":"milady-meme-coin",
-    "KISHU":"kishu-inu","AKITA":"akita-inu","HOGE":"hoge-finance","PEPE2":"pepe-2-0",
-}
-
-def cg_headers():
-    return {"accept": "application/json"}
-
-def cg_request(url, params=None, max_retries=6):
-    """
-    Robust GET with exponential backoff + jitter on 429/5xx.
-    - Sends API key via query param: x_cg_demo_api_key=<KEY> (works for demo/pro)
-    - Surfaces server message on 4xx to help debugging.
-    """
-    key = os.getenv("COINGECKO_API_KEY", "").strip()
-    q = dict(params or {})
-    if key:
-        q.setdefault("x_cg_demo_api_key", key)
-
-    backoff = 1.5
-    last_err = None
-    for attempt in range(1, max_retries + 1):
-        r = SESSION.get(url, params=q, headers=cg_headers(), timeout=TIMEOUT_S)
-        if r.status_code == 200:
-            return r
-        try:
-            detail = r.json()
-        except Exception:
-            detail = {"text": r.text[:300]}
-
-        if r.status_code in (401, 403):
-            raise RuntimeError(f"CoinGecko auth error {r.status_code}: {detail}")
-
-        if r.status_code in (408, 425, 429, 500, 502, 503, 504, 520, 522):
-            sleep_s = backoff * (1.0 + 0.25 * random.random())
-            log(f"CG {r.status_code} — retry {attempt}/{max_retries} in {sleep_s:.1f}s … {detail}")
-            time.sleep(sleep_s); backoff *= 1.8; last_err = detail; continue
-
-        raise RuntimeError(f"CoinGecko error {r.status_code}: {detail}")
-    raise RuntimeError(f"CoinGecko retries exhausted. Last error: {last_err}")
-
-def cg_get_id(symbol):
-    if symbol in COINGECKO_IDS:
-        return COINGECKO_IDS[symbol]
-    try:
-        r = cg_request(f"{CG_BASE}/coins/list", params={"include_platform":"false"})
-        items = r.json()
-        sym_lower = symbol.lower()
-        candidates = [x for x in items if x.get("symbol","").lower() == sym_lower]
-        if not candidates: return None
-        candidates = sorted(candidates, key=lambda x: (x["id"].startswith(sym_lower)==False, len(x["id"])))
-        return candidates[0]["id"]
-    except Exception:
-        return None
-
-def _clamped_days_from(start_str):
-    """Return min(days from start to today + small buffer, CG_MAX_DAYS)."""
-    try:
-        start_dt = pd.to_datetime(start_str).tz_localize(None)
-    except Exception:
-        start_dt = pd.Timestamp.today().normalize() - pd.Timedelta(days=CG_MAX_DAYS-1)
-    today = pd.Timestamp.today().tz_localize(None).normalize()
-    days = max(1, int((today - start_dt).days) + 2)  # +2 buffer
-    if days > CG_MAX_DAYS:
-        log(f"NOTE: Free-tier clamp active — requesting only last {CG_MAX_DAYS} days (wanted ~{days}).")
-        days = CG_MAX_DAYS
-    return days
-
-def cg_market_chart_df(cg_id, vs="usd", days=365):
-    """
-    /coins/{id}/market_chart?vs_currency=usd&days=<days>&interval=daily
-    """
-    url = f"{CG_BASE}/coins/{cg_id}/market_chart"
-    r = cg_request(url, params={"vs_currency": vs, "days": str(days), "interval": "daily"})
-    j = r.json()
-    prices = j.get("prices", [])
-    vols   = j.get("total_volumes", [])
-    if not prices:
-        return pd.DataFrame()
-    p = pd.DataFrame(prices, columns=["ts", "price"])
-    v = pd.DataFrame(vols,   columns=["ts", "vol"])
-    df = p.merge(v, on="ts", how="left")
-    df["Date"] = pd.to_datetime(df["ts"], unit="ms", utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
-    df = df.set_index("Date").sort_index()
-    df = df.rename(columns={"price":"Close","vol":"DollarVolume"})
-    df["Open"] = df["Close"]; df["High"] = df["Close"]; df["Low"] = df["Close"]
-    df["VolumeFrom"] = (df["DollarVolume"] / df["Close"]).replace([np.inf,-np.inf], np.nan)
-    df["VolumeTo"]   = df["DollarVolume"]
-    return df[["Open","High","Low","Close","VolumeFrom","VolumeTo"]]
+# -------------------------------- CryptoCompare fetch (one call / coin) --------------------------------
+def cc_headers():
+    # HARD-CODED per your request:
+    # WARNING: if this repo is public, anyone can see/use this key.
+    return {"authorization": "Apikey a55186d85e35483897d53202ef34133633560089f1b1f3e682c01edcfe043900"}
 
 def _cache_path(sym, tsym="USD"):
-    return os.path.join(CACHE_DIR, f"{sym}_{tsym}_coingecko.parquet")
+    return os.path.join(CACHE_DIR, f"{sym}_{tsym}_cccagg.parquet")
 
-def get_ohlcv_cg_cached(symbol, start="2021-01-01"):
-    path = _cache_path(symbol, "USD")
-    req_days = _clamped_days_from(start)
+def cc_histoday_all(sym, tsym="USD"):
+    """
+    Single request for full daily history using allData=true on CCCAGG.
+    This avoids paging/loops and keeps total calls minimal.
+    """
+    url = "https://min-api.cryptocompare.com/data/v2/histoday"
+    params = {"fsym": sym, "tsym": tsym, "allData": "true"}   # <- key bit
+    r = SESSION.get(url, params=params, headers=cc_headers(), timeout=TIMEOUT_S)
+    if r.status_code == 429:
+        raise RuntimeError("CC 429: rate limit")
+    r.raise_for_status()
+    j = r.json()
+    if j.get("Response") != "Success":
+        raise RuntimeError(j.get("Message", "CC error"))
+    df = pd.DataFrame(j["Data"]["Data"])
+    if df.empty:
+        return pd.DataFrame()
+    df["Date"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
+    df = df.set_index("Date").rename(columns={
+        "open":"Open","high":"High","low":"Low","close":"Close",
+        "volumefrom":"VolumeFrom","volumeto":"VolumeTo"
+    })
+    return df
+
+def get_ohlcv_cc_cached(sym, start="2021-01-01"):
+    # Use cache if present, otherwise fetch once and cache.
+    path = _cache_path(sym, "USD")
     if os.path.exists(path):
         try:
             df = pd.read_parquet(path)
-            # top-up last ~20d
+            # light top-up of latest ~2 weeks to cover any corrections
             try:
-                cg_id = cg_get_id(symbol)
-                if cg_id:
-                    fresh = cg_market_chart_df(cg_id, "usd", days=min(21, CG_MAX_DAYS)).last("20D")
-                    df = pd.concat([df, fresh]).sort_index()
-                    df = df[~df.index.duplicated(keep="last")]
-                    df.to_parquet(path)
+                fresh = cc_histoday_all(sym, "USD").last("20D")
+                df = pd.concat([df, fresh]).sort_index()
+                df = df[~df.index.duplicated(keep="last")]
+                df.to_parquet(path)
             except Exception:
                 pass
-            return df[df.index >= pd.Timestamp.today().tz_localize(None).normalize() - pd.Timedelta(days=req_days+2)]
+            return df[df.index >= pd.to_datetime(start)]
         except Exception:
             pass
-    cg_id = cg_get_id(symbol)
-    if not cg_id:
-        raise RuntimeError(f"Could not resolve CoinGecko id for symbol '{symbol}'. Add it to COINGECKO_IDS.")
-    df = cg_market_chart_df(cg_id, "usd", days=req_days)
+    df = cc_histoday_all(sym, "USD")
     if not df.empty:
         try: df.to_parquet(path)
         except Exception: pass
-    return df
+    return df[df.index >= pd.to_datetime(start)]
 
 def get_ohlcv(symbol, start="2021-01-01"):
-    return get_ohlcv_cg_cached(symbol, start=start)
+    return get_ohlcv_cc_cached(symbol, start=start)
 
 # -------------------------------- Indicators --------------------------------
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
@@ -213,17 +136,17 @@ def sharpe(r, ppy=365):
 # -------------------------------- Alignment --------------------------------
 def load_universe(symbols, start):
     frames, failed = {}, []
-    log("CG key present: " + ("YES" if os.getenv("COINGECKO_API_KEY") else "NO"))
-    for sym in symbols:
+    for i, sym in enumerate(symbols):
         try:
             df = get_ohlcv(sym, start=start)
             if df is None or df.empty: failed.append(sym)
             else: frames[sym] = df
         except Exception as e:
             failed.append(sym); log(f"FAIL {sym}: {e}")
-        time.sleep(PER_REQUEST_DELAY_S * (1.0 + 0.25*random.random()))
+        # tiny polite delay
+        time.sleep(0.05)
     if failed: log(f"Skipped (no market / error): {failed}")
-    if not frames: raise RuntimeError("No symbols had valid markets on CoinGecko.")
+    if not frames: raise RuntimeError("No symbols had valid markets on CryptoCompare.")
     return frames
 
 def align_panel(frames):
@@ -251,15 +174,14 @@ def exposure_from_breadth(breadth_pct, bmin=BREADTH_MIN, bfull=BREADTH_FULL):
     return float(np.clip(x, 0.0, 1.0))
 
 def entry_checks_for_day(idx, C,H,L,V, ema20,ema50, rsi3,rsi14, r7, r10, sh7, ema_diff):
-    checks = {
-        ">EMA20":   (C.loc[idx] > ema20.loc[idx]),
-        "RSI3>55":  (rsi3.loc[idx] > 55),
-        "RSI14>50": (rsi14.loc[idx] > 50),
-        "ROC10>0":  (r10.loc[idx] > 0),
-        "7d>0":     (r7.loc[idx]  > 0),
-        "Sharpe+":  (sh7.loc[idx] > 0),
-        "EMA+":     (ema_diff.loc[idx] > 0),
-    }
+    checks = {}
+    checks[">EMA20"]   = (C.loc[idx] > ema20.loc[idx])
+    checks["RSI3>55"]  = (rsi3.loc[idx] > 55)
+    checks["RSI14>50"] = (rsi14.loc[idx] > 50)
+    checks["ROC10>0"]  = (r10.loc[idx] > 0)
+    checks["7d>0"]     = (r7.loc[idx]  > 0)
+    checks["Sharpe+"]  = (sh7.loc[idx] > 0)
+    checks["EMA+"]     = (ema_diff.loc[idx] > 0)
     df = pd.DataFrame(checks)
     entry_pct = df.mean(axis=1) * 100.0
     return df, entry_pct
@@ -363,16 +285,6 @@ def build_table_today(C,H,L,V,VT):
 
 # -------------------------------- Backtest --------------------------------
 def backtest(C,H,L,V,VT, start=None, end=None):
-    # Clamp backtest window to data we actually have (free tier ≈ last CG_MAX_DAYS)
-    dates = C.index
-    if start:
-        start_dt = pd.to_datetime(start)
-        min_dt = max(start_dt, dates.max() - pd.Timedelta(days=CG_MAX_DAYS-2))
-        dates = dates[dates >= min_dt]
-    if end:
-        dates = dates[dates <= pd.to_datetime(end)]
-    if len(dates) < 30: raise RuntimeError("Backtest window too short (free tier only has ~last 365 days).")
-
     ret1 = C.pct_change()
     r7  = C.pct_change(7);  r14 = C.pct_change(14);  r10 = C.pct_change(10)
     rsi3  = C.apply(lambda s: rsi(s, 3));  rsi14 = C.apply(lambda s: rsi(s,14))
@@ -381,6 +293,11 @@ def backtest(C,H,L,V,VT, start=None, end=None):
     sh7 = ret1.rolling(7).apply(lambda x: sharpe(pd.Series(x)), raw=False)
     ema_diff = (C/ema50 - 1.0) * 100.0
     dv14 = VT.rolling(ROLL_VOL_DAYS).sum()
+
+    dates = C.index
+    if start: dates = dates[dates >= pd.to_datetime(start)]
+    if end:   dates = dates[dates <= pd.to_datetime(end)]
+    if len(dates) < 30: raise RuntimeError("Backtest window too short.")
 
     equity = pd.Series(index=dates, dtype=float); equity.iloc[0] = 1.0
     for i in range(1, len(dates)):
@@ -441,7 +358,7 @@ def backtest(C,H,L,V,VT, start=None, end=None):
     stats = {"TotalReturn": float(total_ret), "CAGR": float(cagr), "Sharpe": float(sh), "Sortino": float(so), "MaxDD": float(mdd)}
     return equity, btc_eq, stats
 
-# -------------------------------- HTML + PNG table (unchanged look) --------------------------------
+# -------------------------------- HTML + PNG table --------------------------------
 def style_table(df, meta):
     caption = (
         f"Meme Screener — Top {len(df)} by 14d $Volume — {meta['today'].date()}  |  "
@@ -604,7 +521,7 @@ def save_table_png(df, meta, path, max_rows=25):
 
 # -------------------------------- MAIN --------------------------------
 def main():
-    log("Downloading daily data from CoinGecko (free-tier friendly; ≤365d) …")
+    log("Downloading daily data from CryptoCompare (CCCAGG, allData=true) …")
     frames = load_universe(MEME_TICKERS, start=LOOKBACK_START)
     C,H,L,V,VT = align_panel(frames)
 
@@ -622,32 +539,29 @@ def main():
     with open(OUT_HTML, "w", encoding="utf-8") as f: f.write(styled.to_html())
     save_table_png(table, meta, OUT_TABLE_PNG, max_rows=TOP_K_DOLLAR_VOL)
 
-    # Backtest (auto-clamped to available window)
+    # Backtest
     if RUN_BACKTEST:
-        try:
-            eq, btc_eq, stats = backtest(C,H,L,V,VT, start=BACKTEST_START, end=BACKTEST_END)
-            plt.figure(figsize=(11,5.8))
-            plt.plot(eq.index, eq.values, label="RSPS (hybrid)")
-            if btc_eq is not None:
-                plt.plot(eq.index, btc_eq.reindex(eq.index).values, label="BTC HODL")
-            plt.yscale("log")
-            plt.title(f"RSPS vs BTC (log scale) — {eq.index[0].date()} → {eq.index[-1].date()}")
-            plt.xlabel("Date"); plt.ylabel("Equity (log)")
-            box = (
-                f"Total: { (eq.iloc[-1]-1.0)*100:.1f}%\n"
-                f"CAGR:  { ((eq.iloc[-1]) ** (365.0/len(eq)) - 1.0)*100:.1f}%\n"
-                f"Sharpe:{ stats.get('Sharpe',0.0):.2f}\n"
-                f"Sort.: { stats.get('Sortino',0.0):.2f}\n"
-                f"MaxDD: { stats.get('MaxDD',0.0)*100:.1f}%"
-            )
-            plt.legend()
-            plt.gcf().text(0.78, 0.50, box, fontsize=10,
-                           bbox=dict(boxstyle="round", facecolor="#111", edgecolor="#444"),
-                           color="#ddd")
-            plt.tight_layout(); plt.savefig(OUT_BACKTEST_PNG, dpi=150); plt.close()
-            log(f"Saved backtest PNG -> {os.path.abspath(OUT_BACKTEST_PNG)}")
-        except Exception as e:
-            log(f"Backtest skipped: {e}")
+        eq, btc_eq, stats = backtest(C,H,L,V,VT, start=BACKTEST_START, end=BACKTEST_END)
+        plt.figure(figsize=(11,5.8))
+        plt.plot(eq.index, eq.values, label="RSPS (hybrid)")
+        if btc_eq is not None:
+            plt.plot(eq.index, btc_eq.reindex(eq.index).values, label="BTC HODL")
+        plt.yscale("log")
+        plt.title(f"RSPS vs BTC (log scale) — {BACKTEST_START} → {eq.index[-1].date()}")
+        plt.xlabel("Date"); plt.ylabel("Equity (log)")
+        box = (
+            f"Total: {stats['TotalReturn']*100:.1f}%\n"
+            f"CAGR:  {stats['CAGR']*100:.1f}%\n"
+            f"Sharpe:{stats['Sharpe']:.2f}\n"
+            f"Sort.: {stats['Sortino']:.2f}\n"
+            f"MaxDD: {stats['MaxDD']*100:.1f}%"
+        )
+        plt.legend()
+        plt.gcf().text(0.78, 0.50, box, fontsize=10,
+                       bbox=dict(boxstyle="round", facecolor="#111", edgecolor="#444"),
+                       color="#ddd")
+        plt.tight_layout(); plt.savefig(OUT_BACKTEST_PNG, dpi=150); plt.close()
+        log(f"Saved backtest PNG -> {os.path.abspath(OUT_BACKTEST_PNG)}")
 
     # Console summary
     print("\n===== Meme Screener —", meta['today'].date(), "=====")
@@ -658,6 +572,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
