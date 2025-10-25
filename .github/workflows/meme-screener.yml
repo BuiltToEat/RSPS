@@ -1,141 +1,81 @@
-name: Meme Screener — 2 screenshots daily (compressed)
+name: Meme Screener Daily
 
 on:
   schedule:
-    - cron: "0 0 * * *"           # 00:00 UTC daily
-  workflow_dispatch: {}
+    # 00:05 UTC = 11:05 AM Australia/Sydney during DST
+    - cron: '05 00 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: meme-screener-daily
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     env:
       TZ: Australia/Sydney
-      MPLBACKEND: Agg
-      # your CC key + Discord webhook:
-      CRYPTOCOMPARE_API_KEY: d5ddb7a7f49de4d4a8af07e98e0ebf437e7acc8bb282f12af978320486f741e7
-      DISCORD_WEBHOOK_URL: https://discord.com/api/webhooks/1429701285975949322/fS0y9EkVQtnP15CJkAQEHEdpgL5Hlk43-Ct4D9uyZjjJT2jbk9nPkETT5cbbGGDyPVqD
+      # set this secret in: Settings → Secrets and variables → Actions → New repository secret
+      COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+      # optional: slow requests a touch to avoid 429s on first full-history pull
+      CG_DELAY_S: "1.8"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
+          cache: 'pip'
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install numpy pandas requests matplotlib pyarrow jinja2
+          pip install --upgrade requests pandas numpy matplotlib pyarrow fastparquet
 
-      - name: Run screener (ALT LEAGUE, no extension)
+      # Optional: verify the key is present (won't print it)
+      - name: Sanity check env
         run: |
-          echo "Sydney: $(date)"
-          python "ALT LEAGUE" || true
+          test -n "$COINGECKO_API_KEY" || (echo "COINGECKO_API_KEY is missing"; exit 1)
+          python - << 'PY'
+          import os; print("CG_DELAY_S =", os.getenv("CG_DELAY_S","(default)"))
+          PY
 
-      - name: Show repo tree (for debugging)
-        run: |
-          echo "==== TREE top ===="; ls -lah
-          echo "==== TREE 2-deep ===="; find . -maxdepth 2 -type f -printf "%p\t%k KB\n" | sort
+      - name: Run screener
+        run: python "ALT LEAGUE"
 
-      - name: Hunt + collect outputs
-        run: |
-          set -e
-          mkdir -p out
-          for f in meme_screener_daily.html meme_screener_daily.csv meme_rsps_backtest.png meme_screener_table.png; do
-            [ -f "$f" ] && cp -f "$f" out/
-          done
-          [ ! -f out/meme_screener_daily.html ] && H=$(find . -type f -iname "*screener*.html" -print | head -n1 || true) && [ -n "$H" ] && cp -f "$H" out/meme_screener_daily.html
-          [ ! -f out/meme_screener_daily.csv ]  && C=$(find . -type f -iname "*screener*.csv"  -print | head -n1 || true) && [ -n "$C" ] && cp -f "$C" out/meme_screener_daily.csv
-          [ ! -f out/meme_rsps_backtest.png ]   && P=$(find . -type f -iname "*backtest*.png"   -print | head -n1 || true) && [ -n "$P" ] && cp -f "$P" out/meme_rsps_backtest.png
-          echo "==== out/ after collect ===="; ls -lah out || true
-
-      - name: Install screenshot + image tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wkhtmltopdf imagemagick
-          wkhtmltoimage --version || true
-          convert --version || true
-
-      - name: Render table → out/table.jpg (small)
-        run: |
-          if [ -f out/meme_screener_daily.html ]; then
-            wkhtmltoimage --width 1500 --quality 82 --format jpg \
-              out/meme_screener_daily.html out/table.jpg || true
-          elif [ -f out/meme_screener_table.png ]; then
-            # if HTML render fails, fallback: compress PNG to JPEG
-            convert out/meme_screener_table.png -resize 1600x -strip -quality 85 out/table.jpg || true
-          fi
-          ls -lah out || true
-
-      - name: Normalize backtest → out/backtest.jpg (small)
-        run: |
-          if [ -f out/meme_rsps_backtest.png ]; then
-            convert out/meme_rsps_backtest.png -resize 1600x -strip -quality 85 out/backtest.jpg
-          elif ls out/*backtest*.png 1>/dev/null 2>&1; then
-            SRC="$(ls out/*backtest*.png | head -n1)"
-            convert "$SRC" -resize 1600x -strip -quality 85 out/backtest.jpg
-          fi
-          ls -lah out || true
-
-      - name: Ensure images < 7.5 MB (recompress loop)
-        run: |
-          shrink() {
-            IMG="$1"
-            [ -f "$IMG" ] || return 0
-            SZ=$(stat -c%s "$IMG")
-            LIM=$((7500*1024))
-            if [ "$SZ" -le "$LIM" ]; then
-              echo "$IMG size OK: $((SZ/1024)) KB"; return 0
-            fi
-            echo "$IMG too big ($((SZ/1024)) KB) -> recompressing..."
-            Q=80
-            while [ "$SZ" -gt "$LIM" ] && [ "$Q" -ge 50 ]; do
-              convert "$IMG" -strip -quality $Q -resize 1600x "$IMG"
-              SZ=$(stat -c%s "$IMG"); echo "  -> quality $Q -> $((SZ/1024)) KB"
-              Q=$((Q-5))
-            done
-          }
-          shrink out/table.jpg
-          shrink out/backtest.jpg
-          ls -lah out || true
-
-      - name: Post to Discord (2 screenshots + csv; with HTTP codes)
-        run: |
-          set -e
-          SYD_DATE="$(date +%Y-%m-%d)"
-          echo "DEBUG: out/ before post"; ls -lah out || true
-
-          echo "DEBUG: base message"
-          curl -sS -o /tmp/resp1.txt -w "HTTP:%{http_code}\n" \
-               -H "Content-Type: application/json" \
-               -X POST "$DISCORD_WEBHOOK_URL" \
-               -d "{\"content\":\"Meme Screener — ${SYD_DATE}\nTable + equity curve.\"}"
-          echo "Base response:"; cat /tmp/resp1.txt || true
-
-          declare -a args
-          [ -f out/table.jpg ] && args+=(-F "file1=@out/table.jpg;type=image/jpeg;filename=table-${SYD_DATE}.jpg")
-          [ -f out/backtest.jpg ] && args+=(-F "file2=@out/backtest.jpg;type=image/jpeg;filename=backtest-${SYD_DATE}.jpg")
-          [ -f out/meme_screener_daily.csv ] && args+=(-F "file3=@out/meme_screener_daily.csv;type=text/csv;filename=screener-${SYD_DATE}.csv")
-
-          if [ ${#args[@]} -gt 0 ]; then
-            echo "DEBUG: posting attachments"
-            curl -sS -o /tmp/resp2.txt -w "HTTP:%{http_code}\n" \
-                 -X POST "$DISCORD_WEBHOOK_URL" \
-                 -F "payload_json={\"content\":\"Attachments for ${SYD_DATE}\"}" \
-                 "${args[@]}"
-            echo "Attachment response:"; cat /tmp/resp2.txt || true
-          else
-            echo "No attachments found."
-          fi
-
-      - name: Upload artifacts (optional)
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: meme-screener-${{ github.run_id }}
-          path: out/
+          name: meme-screener
+          path: |
+            meme_screener_daily.html
+            meme_screener_daily.csv
+            meme_screener_table.png
+            meme_rsps_backtest.png
+          if-no-files-found: warn
+
+      # --- Optional: post images to Discord (uncomment + add secret DISCORD_WEBHOOK) ---
+      # - name: Post to Discord
+      #   if: always()
+      #   env:
+      #     DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      #   run: |
+      #     python - << 'PY'
+      #     import os, requests
+      #     wh = os.getenv("DISCORD_WEBHOOK")
+      #     for fn in ["meme_screener_table.png", "meme_rsps_backtest.png"]:
+      #         if not os.path.exists(fn): continue
+      #         with open(fn, "rb") as f:
+      #             requests.post(wh, files={"file": (fn, f, "image/png")})
+      #     PY
+
 
 
 
