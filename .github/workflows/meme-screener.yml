@@ -19,10 +19,10 @@ jobs:
     timeout-minutes: 30
     env:
       TZ: Australia/Sydney
-      # set this secret in: Settings → Secrets and variables → Actions → New repository secret
+      # You already created this:
       COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
-      # optional: slow requests a touch to avoid 429s on first full-history pull
-      CG_DELAY_S: "1.8"
+      # Slightly gentler pacing for demo tier (tune 2.0–2.5 if needed)
+      CG_DELAY_S: "2.2"
 
     steps:
       - name: Checkout
@@ -37,14 +37,15 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
+          # if you prefer, you can instead: pip install -r requirements.txt
           pip install --upgrade requests pandas numpy matplotlib pyarrow fastparquet
 
-      # Optional: verify the key is present (won't print it)
-      - name: Sanity check env
+      - name: Sanity check env (won't print your key)
         run: |
-          test -n "$COINGECKO_API_KEY" || (echo "COINGECKO_API_KEY is missing"; exit 1)
           python - << 'PY'
-          import os; print("CG_DELAY_S =", os.getenv("CG_DELAY_S","(default)"))
+          import os
+          print("CG key present:", bool(os.getenv("COINGECKO_API_KEY")))
+          print("CG_DELAY_S =", os.getenv("CG_DELAY_S"))
           PY
 
       - name: Run screener
@@ -61,20 +62,6 @@ jobs:
             meme_rsps_backtest.png
           if-no-files-found: warn
 
-      # --- Optional: post images to Discord (uncomment + add secret DISCORD_WEBHOOK) ---
-      # - name: Post to Discord
-      #   if: always()
-      #   env:
-      #     DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-      #   run: |
-      #     python - << 'PY'
-      #     import os, requests
-      #     wh = os.getenv("DISCORD_WEBHOOK")
-      #     for fn in ["meme_screener_table.png", "meme_rsps_backtest.png"]:
-      #         if not os.path.exists(fn): continue
-      #         with open(fn, "rb") as f:
-      #             requests.post(wh, files={"file": (fn, f, "image/png")})
-      #     PY
 
 
 
