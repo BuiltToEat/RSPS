@@ -2,7 +2,7 @@ name: Meme Screener — 2 screenshots daily (compressed)
 
 on:
   schedule:
-    - cron: "0 0 * * *"   # 00:00 UTC daily (same as before)
+    - cron: "0 0 * * *"           # 00:00 UTC daily
   workflow_dispatch: {}
 
 jobs:
@@ -12,7 +12,7 @@ jobs:
     env:
       TZ: Australia/Sydney
       MPLBACKEND: Agg
-      PYTHONUNBUFFERED: "1"
+      # your CC key + Discord webhook:
       CRYPTOCOMPARE_API_KEY: d5ddb7a7f49de4d4a8af07e98e0ebf437e7acc8bb282f12af978320486f741e7
       DISCORD_WEBHOOK_URL: https://discord.com/api/webhooks/1429701285975949322/fS0y9EkVQtnP15CJkAQEHEdpgL5Hlk43-Ct4D9uyZjjJT2jbk9nPkETT5cbbGGDyPVqD
 
@@ -28,33 +28,12 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            # pyarrow for Parquet cache; matplotlib for charts.
-            pip install numpy pandas requests matplotlib pyarrow
-          fi
-          pip install "jinja2>=3.1,<4"
+          pip install numpy pandas requests matplotlib pyarrow jinja2
 
-      # ---------- Cache CC history between runs (prevents daily throttling) ----------
-      - name: Cache CC history
-        uses: actions/cache@v4
-        with:
-          path: .cc_cache
-          key: ${{ runner.os }}-cccache-${{ github.ref_name }}
-          restore-keys: |
-            ${{ runner.os }}-cccache-
-
-      # ---------- Run your CC-only screener ----------
       - name: Run screener (ALT LEAGUE, no extension)
         run: |
-          set -euo pipefail
           echo "Sydney: $(date)"
-          python -V
-          echo "CC ping (best-effort):"
-          curl -sS "https://min-api.cryptocompare.com/stats" | head -c 200 || true
-          # Run the script named exactly 'ALT LEAGUE' (no extension). Quotes matter due to the space.
-          timeout 20m python -u "./ALT LEAGUE"
+          python "ALT LEAGUE" || true
 
       - name: Show repo tree (for debugging)
         run: |
@@ -65,33 +44,29 @@ jobs:
         run: |
           set -e
           mkdir -p out
-          # Expected names produced by the script
           for f in meme_screener_daily.html meme_screener_daily.csv meme_rsps_backtest.png meme_screener_table.png; do
             [ -f "$f" ] && cp -f "$f" out/
           done
-          # Fallback scan (just in case filenames differ)
           [ ! -f out/meme_screener_daily.html ] && H=$(find . -type f -iname "*screener*.html" -print | head -n1 || true) && [ -n "$H" ] && cp -f "$H" out/meme_screener_daily.html
           [ ! -f out/meme_screener_daily.csv ]  && C=$(find . -type f -iname "*screener*.csv"  -print | head -n1 || true) && [ -n "$C" ] && cp -f "$C" out/meme_screener_daily.csv
           [ ! -f out/meme_rsps_backtest.png ]   && P=$(find . -type f -iname "*backtest*.png"   -print | head -n1 || true) && [ -n "$P" ] && cp -f "$P" out/meme_rsps_backtest.png
-          [ ! -f out/meme_screener_table.png ]  && T=$(find . -type f -iname "*table*.png"      -print | head -n1 || true) && [ -n "$T" ] && cp -f "$T" out/meme_screener_table.png
           echo "==== out/ after collect ===="; ls -lah out || true
 
-      # Make JPEG screenshots and compress if needed (Discord-friendly)
-      - name: Install image tools
+      - name: Install screenshot + image tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y imagemagick wkhtmltopdf
-          convert --version || true
+          sudo apt-get install -y wkhtmltopdf imagemagick
           wkhtmltoimage --version || true
+          convert --version || true
 
       - name: Render table → out/table.jpg (small)
         run: |
-          # Prefer the script's PNG table; otherwise render HTML to image.
-          if [ -f out/meme_screener_table.png ]; then
-            convert out/meme_screener_table.png -resize 1600x -strip -quality 85 out/table.jpg
-          elif [ -f out/meme_screener_daily.html ]; then
+          if [ -f out/meme_screener_daily.html ]; then
             wkhtmltoimage --width 1500 --quality 82 --format jpg \
               out/meme_screener_daily.html out/table.jpg || true
+          elif [ -f out/meme_screener_table.png ]; then
+            # if HTML render fails, fallback: compress PNG to JPEG
+            convert out/meme_screener_table.png -resize 1600x -strip -quality 85 out/table.jpg || true
           fi
           ls -lah out || true
 
@@ -113,15 +88,13 @@ jobs:
             SZ=$(stat -c%s "$IMG")
             LIM=$((7500*1024))
             if [ "$SZ" -le "$LIM" ]; then
-              echo "$IMG size OK: $((SZ/1024)) KB"
-              return 0
+              echo "$IMG size OK: $((SZ/1024)) KB"; return 0
             fi
             echo "$IMG too big ($((SZ/1024)) KB) -> recompressing..."
             Q=80
-            while [ "$SZ" -gt "$LIM" ) ] && [ "$Q" -ge 50 ]; do
+            while [ "$SZ" -gt "$LIM" ] && [ "$Q" -ge 50 ]; do
               convert "$IMG" -strip -quality $Q -resize 1600x "$IMG"
-              SZ=$(stat -c%s "$IMG")
-              echo "  -> quality $Q -> $((SZ/1024)) KB"
+              SZ=$(stat -c%s "$IMG"); echo "  -> quality $Q -> $((SZ/1024)) KB"
               Q=$((Q-5))
             done
           }
@@ -163,6 +136,7 @@ jobs:
         with:
           name: meme-screener-${{ github.run_id }}
           path: out/
+
 
 
 
