@@ -1,8 +1,8 @@
-# ============================= Meme-Coin Screener — CC ONLY (cached) =============================
-# File name:  ALT LEAGUE   (no extension; invoked with:  python "ALT LEAGUE")
-# Behavior:   Same as before (daily table + backtest), BUT with CryptoCompare-only + persistent cache
+# ============================= Meme-Coin Screener — CC ONLY (CCCAGG) =============================
+# File name:  ALT LEAGUE   (no extension; invoke with:  python "ALT LEAGUE")
+# Behavior:   Daily table + backtest, using CryptoCompare's CCCAGG only (no per-exchange requests)
 # Outputs:    meme_screener_daily.html, meme_screener_daily.csv, meme_screener_table.png, meme_rsps_backtest.png
-# Notes:      Requires env CRYPTOCOMPARE_API_KEY. Cache at .cc_cache/ to avoid daily throttling.
+# Notes:      Requires env CRYPTOCOMPARE_API_KEY. Uses .cc_cache/ to avoid excess API calls.
 
 import os, time, math, random, webbrowser
 from datetime import datetime, date
@@ -38,9 +38,9 @@ MIN_SHOW_WEIGHT    = 0.25
 # Outputs (same names + new table PNG)
 OUT_HTML         = "meme_screener_daily.html"
 OUT_CSV          = "meme_screener_daily.csv"
-OUT_TABLE_PNG    = "meme_screener_table.png"   # <-- direct PNG table
+OUT_TABLE_PNG    = "meme_screener_table.png"   # direct PNG table
 OUT_BACKTEST_PNG = "meme_rsps_backtest.png"    # backtest (log equity)
-OPEN_AFTER_SAVE  = False                        # CI will post to Discord
+OPEN_AFTER_SAVE  = False                        # CI posts to Discord
 
 # Backtest window
 BACKTEST_START = "2021-01-01"
@@ -53,12 +53,13 @@ BASE_SLEEP  = 0.6
 WAIT_CAP    = 5.0
 SLEEP_BETWEEN_SYMBOLS = 0.5
 
+# ----- Force CCCAGG only (composite feed) -----
+FORCE_CCCAGG = True
+EXCHANGES_TRY = [None]  # only CCCAGG
+
 # ----- Caching -----
 CACHE_DIR = ".cc_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
-
-# Try these CC exchanges (None = CCCAGG). We stay on CC, not direct Binance.
-EXCHANGES_TRY = ["BINANCE","BYBIT","OKX","KUCOIN","BITGET","GATEIO","KRAKEN","COINBASE", None]
 
 np.set_printoptions(suppress=True)
 pd.set_option("display.width", 180)
@@ -66,7 +67,7 @@ pd.set_option("display.max_columns", 50)
 
 def log(msg): print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
-# ------------------------------ CryptoCompare fetch (cached) ------------------------------
+# ------------------------------ CryptoCompare fetch (cached, CCCAGG only) ------------------------------
 def cc_headers():
     key = os.getenv("CRYPTOCOMPARE_API_KEY", "").strip()
     if not key:
@@ -77,15 +78,22 @@ def _is_no_market(j) -> bool:
     msg = (j or {}).get("Message","").lower()
     return any(k in msg for k in ["market does not exist","pair not found","there is no data"])
 
-def _cache_path(sym, tsym, ex):
-    tag = (ex or "CCCAGG").lower()
-    return os.path.join(CACHE_DIR, f"{sym}_{tsym}_{tag}.parquet")
+def _cache_path(sym, tsym):
+    # always CCCAGG
+    return os.path.join(CACHE_DIR, f"{sym}_{tsym}_cccagg.parquet")
 
 def cc_histoday_page_with(sym, tsym="USD", exchange=None, limit=2000, toTs=None):
+    # Always use CCCAGG when forced
+    if FORCE_CCCAGG:
+        exchange = None
+
     url = "https://min-api.cryptocompare.com/data/v2/histoday"
     params = {"fsym": sym, "tsym": tsym, "limit": min(2000, limit)}
-    if toTs is not None: params["toTs"] = int(toTs)
-    if exchange: params["e"] = exchange
+    if toTs is not None:
+        params["toTs"] = int(toTs)
+    if exchange:
+        params["e"] = exchange
+
     headers = cc_headers()
     last_err = None
     for k in range(MAX_RETRIES):
@@ -93,21 +101,28 @@ def cc_histoday_page_with(sym, tsym="USD", exchange=None, limit=2000, toTs=None)
             r = SESSION.get(url, params=params, headers=headers, timeout=30)
             if r.status_code == 429:
                 wait = min(WAIT_CAP, BASE_SLEEP*(2**k) + random.uniform(0,0.6))
-                log(f"429 {sym}-{tsym}@{exchange or 'CCCAGG'}; sleep {wait:.1f}s"); time.sleep(wait); continue
+                log(f"429 {sym}-{tsym}@{exchange or 'CCCAGG'}; sleep {wait:.1f}s")
+                time.sleep(wait)
+                continue
             r.raise_for_status()
             data = r.json()
             if data.get("Response") != "Success":
                 msg = data.get("Message","")
                 if "rate limit" in msg.lower():
                     wait = min(WAIT_CAP, BASE_SLEEP*(2**k) + random.uniform(0,0.6))
-                    log(f"CC rate limit {sym}-{tsym}@{exchange or 'CCCAGG'}; sleep {wait:.1f}s"); time.sleep(wait); continue
-                if _is_no_market(data): return None
+                    log(f"CC rate limit {sym}-{tsym}@{exchange or 'CCCAGG'}; sleep {wait:.1f}s")
+                    time.sleep(wait)
+                    continue
+                if _is_no_market(data):
+                    return None
                 last_err = RuntimeError(msg or "Unknown CC error")
                 wait = min(WAIT_CAP, BASE_SLEEP*(2**k) + random.uniform(0,0.6))
                 log(f"CC bad resp {sym}-{tsym}@{exchange}: {last_err} (retry {k+1}/{MAX_RETRIES}, {wait:.1f}s)")
-                time.sleep(wait); continue
+                time.sleep(wait)
+                continue
             df = pd.DataFrame(data["Data"]["Data"])
-            if df.empty: return pd.DataFrame()
+            if df.empty:
+                return pd.DataFrame()
             df["Date"] = pd.to_datetime(df["time"], unit="s", utc=True).dt.tz_convert("UTC").dt.tz_localize(None)
             df = df.set_index("Date").rename(columns={
                 "open":"Open","high":"High","low":"Low","close":"Close",
@@ -117,19 +132,26 @@ def cc_histoday_page_with(sym, tsym="USD", exchange=None, limit=2000, toTs=None)
         except Exception as e:
             last_err = e
             wait = min(WAIT_CAP, BASE_SLEEP*(2**k) + random.uniform(0,0.6))
-            log(f"CC error {sym}-{tsym}@{exchange}: {e} (retry {k+1}/{MAX_RETRIES}, {wait:.1f}s)"); time.sleep(wait)
+            log(f"CC error {sym}-{tsym}@{exchange}: {e} (retry {k+1}/{MAX_RETRIES}, {wait:.1f}s)")
+            time.sleep(wait)
     raise RuntimeError(f"Failed CC histoday for {sym}-{tsym}@{exchange}: {last_err}")
 
 def cc_histoday_full_with(sym, tsym="USD", exchange=None, start="2020-01-01"):
+    # Always CCCAGG if forced
+    if FORCE_CCCAGG:
+        exchange = None
+
     target = pd.to_datetime(start)
     df = cc_histoday_page_with(sym, tsym=tsym, exchange=exchange, limit=2000)
-    if df is None or df.empty: return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
     df = df.sort_index()
     earliest = df.index.min()
     while earliest > target:
         toTs = int(earliest.timestamp()) - 86400
         older = cc_histoday_page_with(sym, tsym=tsym, exchange=exchange, limit=2000, toTs=toTs)
-        if older is None or older.empty: break
+        if older is None or older.empty:
+            break
         df = pd.concat([older, df], axis=0)
         df = df[~df.index.duplicated(keep="first")].sort_index()
         earliest = df.index.min()
@@ -137,29 +159,27 @@ def cc_histoday_full_with(sym, tsym="USD", exchange=None, start="2020-01-01"):
     return df[df.index >= pd.to_datetime(start)]
 
 def get_ohlcv_cc_cached(sym, start="2021-01-01"):
-    # Try reading a cache first; if present, top up a few latest candles.
+    # CCCAGG cache first; then top-up
     for tsym in ("USD","USDT"):
-        for ex in EXCHANGES_TRY:
-            path = _cache_path(sym, tsym, ex)
-            if os.path.exists(path):
-                try:
-                    df = pd.read_parquet(path)
-                    newer = cc_histoday_page_with(sym, tsym=tsym, exchange=ex, limit=15)
-                    if isinstance(newer, pd.DataFrame) and not newer.empty:
-                        df = df.combine_first(newer).sort_index()
-                    df.to_parquet(path)
-                    return df[df.index >= pd.to_datetime(start)]
-                except Exception:
-                    pass
-            # Build cache once if missing
-            df_full = cc_histoday_full_with(sym, tsym=tsym, exchange=ex, start=start)
-            if df_full is not None and not df_full.empty:
-                try:
-                    df_full.to_parquet(path)
-                except Exception:
-                    pass
-                return df_full
-    log(f"UNSUPPORTED on CC: {sym} (skipping)")
+        path = _cache_path(sym, tsym)
+        if os.path.exists(path):
+            try:
+                df = pd.read_parquet(path)
+                newer = cc_histoday_page_with(sym, tsym=tsym, exchange=None, limit=15)
+                if isinstance(newer, pd.DataFrame) and not newer.empty:
+                    df = df.combine_first(newer).sort_index()
+                df.to_parquet(path)
+                return df[df.index >= pd.to_datetime(start)]
+            except Exception:
+                pass
+        df_full = cc_histoday_full_with(sym, tsym=tsym, exchange=None, start=start)
+        if df_full is not None and not df_full.empty:
+            try:
+                df_full.to_parquet(path)
+            except Exception:
+                pass
+            return df_full
+    log(f"UNSUPPORTED on CC (CCCAGG): {sym} (skipping)")
     return pd.DataFrame()
 
 def get_ohlcv(symbol, start="2021-01-01"):
@@ -578,7 +598,7 @@ def save_table_png(df, meta, path, max_rows=25):
 
 # ------------------------------ MAIN ------------------------------
 def main():
-    log("Downloading daily data from CryptoCompare (cached) …")
+    log("Downloading daily data from CryptoCompare (CCCAGG, cached) …")
     frames = load_universe(MEME_TICKERS, start=LOOKBACK_START)
     C,H,L,V,VT = align_panel(frames)
 
@@ -628,6 +648,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
