@@ -63,19 +63,14 @@ def log(msg): print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
 # -------------------------------- CryptoCompare fetch (one call / coin) --------------------------------
 def cc_headers():
-    # HARD-CODED per your request:
     return {"authorization": f"Apikey {CRYPTOCOMPARE_API_KEY}"}
 
 def _cache_path(sym, tsym="USD"):
     return os.path.join(CACHE_DIR, f"{sym}_{tsym}_cccagg.parquet")
 
 def cc_histoday_all(sym, tsym="USD"):
-    """
-    Single request for full daily history using allData=true on CCCAGG.
-    This avoids paging/loops and keeps total calls minimal.
-    """
     url = "https://min-api.cryptocompare.com/data/v2/histoday"
-    params = {"fsym": sym, "tsym": tsym, "allData": "true"}   # <- key bit
+    params = {"fsym": sym, "tsym": tsym, "allData": "true"}
     r = SESSION.get(url, params=params, headers=cc_headers(), timeout=TIMEOUT_S)
     if r.status_code == 429:
         raise RuntimeError("CC 429: rate limit")
@@ -94,12 +89,11 @@ def cc_histoday_all(sym, tsym="USD"):
     return df
 
 def get_ohlcv_cc_cached(sym, start="2021-01-01"):
-    # Use cache if present, otherwise fetch once and cache.
     path = _cache_path(sym, "USD")
     if os.path.exists(path):
         try:
             df = pd.read_parquet(path)
-            # light top-up of latest ~2 weeks to cover any corrections
+            # light top-up last ~2 weeks
             try:
                 fresh = cc_histoday_all(sym, "USD").last("20D")
                 df = pd.concat([df, fresh]).sort_index()
@@ -139,14 +133,13 @@ def sharpe(r, ppy=365):
 # -------------------------------- Alignment --------------------------------
 def load_universe(symbols, start):
     frames, failed = {}, []
-    for i, sym in enumerate(symbols):
+    for sym in symbols:
         try:
             df = get_ohlcv(sym, start=start)
             if df is None or df.empty: failed.append(sym)
             else: frames[sym] = df
         except Exception as e:
             failed.append(sym); log(f"FAIL {sym}: {e}")
-        # polite delay not really needed now (one call per coin), but keep tiny sleep
         time.sleep(0.05)
     if failed: log(f"Skipped (no market / error): {failed}")
     if not frames: raise RuntimeError("No symbols had valid markets on CryptoCompare.")
@@ -177,14 +170,15 @@ def exposure_from_breadth(breadth_pct, bmin=BREADTH_MIN, bfull=BREADTH_FULL):
     return float(np.clip(x, 0.0, 1.0))
 
 def entry_checks_for_day(idx, C,H,L,V, ema20,ema50, rsi3,rsi14, r7, r10, sh7, ema_diff):
-    checks = {}
-    checks[">EMA20"]   = (C.loc[idx] > ema20.loc[idx])
-    checks["RSI3>55"]  = (rsi3.loc[idx] > 55)
-    checks["RSI14>50"] = (rsi14.loc[idx] > 50)
-    checks["ROC10>0"]  = (r10.loc[idx] > 0)
-    checks["7d>0"]     = (r7.loc[idx]  > 0)
-    checks["Sharpe+"]  = (sh7.loc[idx] > 0)
-    checks["EMA+"]     = (ema_diff.loc[idx] > 0)
+    checks = {
+        ">EMA20":   (C.loc[idx] > ema20.loc[idx]),
+        "RSI3>55":  (rsi3.loc[idx] > 55),
+        "RSI14>50": (rsi14.loc[idx] > 50),
+        "ROC10>0":  (r10.loc[idx] > 0),
+        "7d>0":     (r7.loc[idx]  > 0),
+        "Sharpe+":  (sh7.loc[idx] > 0),
+        "EMA+":     (ema_diff.loc[idx] > 0),
+    }
     df = pd.DataFrame(checks)
     entry_pct = df.mean(axis=1) * 100.0
     return df, entry_pct
@@ -445,83 +439,6 @@ def style_table(df, meta):
         })
     )
 
-# PNG table (same look)
-_C_HDR      = "#0b0b0b"; _C_BG_EVEN  = "#1b1b1b"; _C_BG_ODD   = "#202020"
-_C_TEXT     = "#dddddd"; _C_TEXT_HDR = "#ffffff"
-_C_BUY      = "#1fa971"; _C_HOLD="#dca408"; _C_SELL="#d14b41"; _C_NT="#555555"
-_C_RON      = "#0f7d4f"; _C_ROFF="#943233"
-_C_POS      = "#10361e"; _C_NEG="#3a1515"
-_C_BAR_G    = "#2fb66f"; _C_BAR_GR="#8a8a8a"
-
-def save_table_png(df, meta, path, max_rows=25):
-    show = df.head(max_rows).copy()
-    cols = ["Rank","Token","Signal","Score","Entry %","Risk Gauge","3d Return","7d Return","14d Return",
-            "RSI Short","RSI Med","Vol. Trend","Momentum","Sharpe 7d","EMA Diff","Close","Confidence %","Suggested Wt %"]
-    cols = [c for c in cols if c in show.columns]; show = show[cols]
-    def fmt(series, spec): return series.map(lambda x: spec.format(x) if pd.notna(x) else "")
-    fmts = {"Score":"{:.1f}","Entry %":"{:.1f}","3d Return":"{:+.2f}","7d Return":"{:+.2f}",
-            "14d Return":"{:+.2f}","RSI Short":"{:.2f}","RSI Med":"{:.2f}","Vol. Trend":"{:+.2f}",
-            "Momentum":"{:+.2f}","Sharpe 7d":"{:.2f}","EMA Diff":"{:+.2f}","Close":"{:.6f}",
-            "Confidence %":"{:.1f}","Suggested Wt %":"{:.1f}"}
-    for c, spec in fmts.items():
-        if c in show.columns: show[c] = fmt(show[c], spec)
-
-    fig, ax = plt.subplots(figsize=(13.5, 0.62*len(show)+2.0)); ax.axis("off")
-    title = (f"Meme Screener — Top {len(show)} by 14d $Volume — {meta['today'].date()}  |  "
-             f"Breadth≥{ENTRY_OK_THRESHOLD:.0f}%: {meta['breadth']:.1f}%  |  "
-             f"Exposure: {meta['exposure']*100:.0f}%  |  Total Alloc: {meta['alloc_sum']:.1f}%")
-    ax.set_title(title, fontsize=12, loc="left", pad=12, color=_C_TEXT)
-
-    table = ax.table(cellText=show.values, colLabels=show.columns, loc="center", cellLoc="center")
-    table.auto_set_font_size(False); table.set_fontsize(9); table.scale(1.0, 1.25)
-    for (r,c), cell in table.get_celld().items():
-        if r == 0:
-            cell.set_facecolor(_C_HDR); cell.set_text_props(color=_C_TEXT_HDR, weight="bold")
-        else:
-            cell.set_facecolor(_C_BG_EVEN if r%2==0 else _C_BG_ODD); cell.set_text_props(color=_C_TEXT)
-
-    col_index = {name:i for i,name in enumerate(show.columns)}
-    if "Signal" in col_index:
-        ci = col_index["Signal"]
-        for r in range(1, len(show)+1):
-            v = show.iloc[r-1]["Signal"]
-            cell = table[r, ci]; cell.set_facecolor({"BUY":_C_BUY,"HOLD":_C_HOLD,"SELL":_C_SELL}.get(v,_C_NT))
-            cell.set_text_props(color="black", weight="bold")
-    if "Risk Gauge" in col_index:
-        ci = col_index["Risk Gauge"]
-        for r in range(1, len(show)+1):
-            v = show.iloc[r-1]["Risk Gauge"]
-            cell = table[r, ci]; cell.set_facecolor(_C_RON if v=="RISK_ON" else _C_ROFF); cell.set_text_props(color="white", weight="bold")
-
-    for sc in [c for c in ["3d Return","7d Return","14d Return","Vol. Trend","Momentum","Sharpe 7d","EMA Diff"] if c in col_index]:
-        ci = col_index[sc]
-        for r in range(1, len(show)+1):
-            try: val = float(show.iloc[r-1][sc])
-            except: val = np.nan
-            if not np.isnan(val): table[r, ci].set_facecolor(_C_POS if val>0 else _C_NEG)
-    for name,thr in [("RSI Short",55),("RSI Med",50)]:
-        if name in col_index:
-            ci = col_index[name]
-            for r in range(1, len(show)+1):
-                try: val = float(show.iloc[r-1][name])
-                except: val = np.nan
-                if not np.isnan(val): table[r, ci].set_facecolor(_C_POS if val>=thr else _C_NEG)
-
-    def add_bar(r, ci, pct, color):
-        cell = table[r, ci]; x, y = cell.get_x(), cell.get_y(); w, h = cell.get_width(), cell.get_height()
-        try: p = max(0.0, min(1.0, float(pct)/100.0))
-        except: p = 0.0
-        rect = Rectangle((x+0.005, y+0.005), p*(w-0.01), h-0.01, transform=ax.transData, linewidth=0, facecolor=color, alpha=0.85, zorder=0.5)
-        ax.add_patch(rect)
-    for name,color in [("Confidence %", _C_BAR_G), ("Suggested Wt %", _C_BAR_GR)]:
-        if name in col_index:
-            ci = col_index[name]
-            for r in range(1, len(show)+1):
-                add_bar(r, ci, show.iloc[r-1][name], color)
-
-    plt.tight_layout(); plt.savefig(path, dpi=150, bbox_inches="tight"); plt.close()
-    log(f"Saved table PNG -> {os.path.abspath(path)}")
-
 # -------------------------------- Discord posting --------------------------------
 def post_to_discord(file_path, webhook=DISCORD_WEBHOOK):
     try:
@@ -553,8 +470,19 @@ def main():
     # Table
     table, meta = build_table_today(C,H,L,V,VT)
     table.to_csv(OUT_CSV, index=False)
-    styled = style_table(table, meta)
-    with open(OUT_HTML, "w", encoding="utf-8") as f: f.write(styled.to_html())
+
+    # --- HTML: try pretty Styler; fallback to plain HTML if jinja2/styler missing ---
+    try:
+        styled = style_table(table, meta)   # requires jinja2
+        html_out = styled.to_html()
+    except Exception as e:
+        log(f"Styler unavailable ({e}); writing plain HTML table instead.")
+        html_out = table.to_html(index=False)
+
+    with open(OUT_HTML, "w", encoding="utf-8") as f:
+        f.write(html_out)
+
+    # PNG table
     save_table_png(table, meta, OUT_TABLE_PNG, max_rows=TOP_K_DOLLAR_VOL)
 
     # Backtest
@@ -595,6 +523,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
