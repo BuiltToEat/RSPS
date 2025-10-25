@@ -61,7 +61,7 @@ def log(msg): print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 def cc_headers():
     # HARD-CODED per your request:
     # WARNING: if this repo is public, anyone can see/use this key.
-    return {"authorization": "Apikey a55186d85e35483897d53202ef34133633560089f1b1f3e682c01edcfe043900"}
+    return {"authorization": "Apikey c7932923a3058aa813332cdb3829b67e4a47998c6bdcf7adfac40d6a0f86c417"}
 
 def _cache_path(sym, tsym="USD"):
     return os.path.join(CACHE_DIR, f"{sym}_{tsym}_cccagg.parquet")
