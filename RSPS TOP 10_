@@ -35,9 +35,12 @@ OPEN_IN_CHROME   = True  # workflow flips this to False on CI
 # ---- Discord (hard-coded) ----
 POST_TO_DISCORD       = True
 DISCORD_WEBHOOK_URL   = "https://canary.discord.com/api/webhooks/1431869296484552734/zxoFGOFClv8JeZWfcLaZGbyv0wBfcyyYWuvNGVOIwFQJbZVDvKQIdzwq3NVgMbAbB6zh"
-DISCORD_USERNAME      = "RSPS TOP 10_"
+DISCORD_USERNAME      = "RSPS TOP10_"
 
-CRYPTOCOMPARE_API_KEY = os.getenv("CRYPTOCOMPARE_API_KEY", "").strip()
+# ---- CryptoCompare API key (env first, else your hardcoded fallback) ----
+_HARDCODED_CC_KEY = "f2591a467b0f5d1ae46b42e28ddf6061af83c305334cbcee13642f8068cc980b"
+CRYPTOCOMPARE_API_KEY = (os.getenv("CRYPTOCOMPARE_API_KEY") or _HARDCODED_CC_KEY).strip()
+
 EXCHANGES_TRY = ["BINANCE","BYBIT","OKX","KUCOIN","BITGET","GATEIO","KRAKEN","COINBASE", None]
 PAIR_CACHE = {}
 MAX_RETRIES = 6
@@ -57,8 +60,8 @@ C_HDR       = "#0b0b0b"
 C_TEXT      = "#dddddd"
 C_TEXT_HDR  = "#ffffff"
 
-C_POS_BASE  = "#10361e"   # base green cell
-C_NEG_BASE  = "#3a1515"   # base red cell
+C_POS_BASE  = "#10361e"
+C_NEG_BASE  = "#3a1515"
 C_POS_EDGE  = "#1f6b3a"
 C_NEG_EDGE  = "#7a2a2a"
 
@@ -510,7 +513,7 @@ def save_table_png(df, meta, path, max_rows=15):
         for r in range(1, len(show)+1):
             cell = the_table[r, cidx]
             text = show.iloc[r-1]["Risk Gauge"]
-            _set_cell_face(cell, C_RISK_ON if text=="RISK_ON" else C_RISK_OFF)
+            _set_cell_face(the_table[r, cidx], C_RISK_ON if text=="RISK_ON" else C_RISK_OFF)
             cell.set_text_props(color="white", weight="bold")
 
     signed_cols = [c for c in ["3d Return","7d Return","14d Return","Vol. Trend","Momentum","Sharpe 7d","EMA Diff"] if c in col_index]
@@ -651,7 +654,7 @@ def post_to_discord(meta, table_png, backtest_png, csv_path=None, html_path=None
 
     add_file(backtest_png)
     add_file(table_png)
-    add_file(csv_path)   # attach CSV; HTML is optional in Discord
+    add_file(csv_path)
 
     payload = {
         "content": content,
@@ -669,17 +672,21 @@ def post_to_discord(meta, table_png, backtest_png, csv_path=None, html_path=None
         for f in files.values():
             try:
                 f[1].close()
-            except:  # noqa
+            except:
                 pass
 
 def json_dumps(obj):
-    # lightweight local JSON dumps to avoid importing full json earlier in file
     import json as _json
     return _json.dumps(obj, separators=(",", ":"))
 
 # ============================= MAIN =============================
 def main():
     log(f"Universe: {MAJORS}")
+    if CRYPTOCOMPARE_API_KEY:
+        log("Using CryptoCompare with API key (env or fallback).")
+    else:
+        log("NO CryptoCompare API key detected (requests may be rate-limited).")
+
     log("Downloading daily data from CryptoCompare …")
     frames = load_universe(MAJORS, start=LOOKBACK_START)
     C,H,L,V,VT = align_panel(frames)
@@ -743,7 +750,7 @@ def main():
         print("  •", os.path.abspath(OUT_CSV))
         print("  •", os.path.abspath(OUT_HTML))
 
-    # ---- Discord post (hard-coded webhook + username) ----
+    # ---- Discord post ----
     try:
         post_to_discord(meta, OUT_TABLE_PNG, OUT_BACKTEST_PNG, csv_path=OUT_CSV, html_path=OUT_HTML)
     except Exception as e:
