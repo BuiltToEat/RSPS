@@ -19,6 +19,7 @@ jobs:
     timeout-minutes: 45
     env:
       TZ: Australia/Sydney
+      # You can still set a secret; script now also has a hardcoded fallback per your request.
       CRYPTOCOMPARE_API_KEY: ${{ secrets.CRYPTOCOMPARE_API_KEY }}
 
     steps:
@@ -36,25 +37,33 @@ jobs:
           python -m pip install --upgrade pip
           pip install --upgrade requests pandas numpy matplotlib
 
-      # Optional guard: allow small delays; only run 11:05–11:20 Sydney time
+      # Gate: only proceed if within 11:05–11:20 Sydney time
       - name: Gate by local time (Sydney)
+        id: gate
+        shell: bash
         run: |
           HOUR=$(date +'%H')
           MIN=$(date +'%M')
-          if [ "$HOUR" != "11" ] || [ "$MIN" -lt 5 ] || [ "$MIN" -gt 20 ]; then
-            echo "Outside the allowed 11:05–11:20 window for Australia/Sydney. Exiting without error."
-            exit 0
+          if [ "$HOUR" = "11" ] && [ "$MIN" -ge 5 ] && [ "$MIN" -le 20 ]; then
+            echo "run_ok=true" >> "$GITHUB_OUTPUT"
+            echo "Within allowed window; proceeding."
+          else
+            echo "run_ok=false" >> "$GITHUB_OUTPUT"
+            echo "Outside the allowed 11:05–11:20 window for Australia/Sydney. Skipping."
           fi
 
       # Headless CI: don't try to open Chrome on the runner
       - name: Disable Chrome auto-open for CI
+        if: steps.gate.outputs.run_ok == 'true'
         run: |
-          sed -i 's/OPEN_IN_CHROME\s*=\s*True/OPEN_IN_CHROME   = False/' "RSPS TOP10_"
+          sed -i 's/OPEN_IN_CHROME\s*=\s*True/OPEN_IN_CHROME   = False/' "RSPS TOP 10_"
 
-      - name: Run screener (generates PNG/CSV/HTML and posts to Discord)
-        run: python "RSPS TOP10_"
+      - name: Run screener (generate PNG/CSV/HTML and post to Discord)
+        if: steps.gate.outputs.run_ok == 'true'
+        run: python "RSPS TOP 10_"
 
       - name: Upload artifacts (PNG/CSV/HTML)
+        if: steps.gate.outputs.run_ok == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: majors-screener-${{ github.run_id }}
@@ -64,4 +73,5 @@ jobs:
             majors_screener_daily.csv
             majors_screener_daily.html
           if-no-files-found: warn
+
 
