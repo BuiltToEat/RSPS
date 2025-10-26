@@ -46,13 +46,13 @@ jobs:
             exit 0
           fi
 
-      # Headless CI: don't try to open Chrome
+      # Headless CI: don't try to open Chrome on the runner
       - name: Disable Chrome auto-open for CI
         run: |
-          sed -i 's/OPEN_IN_CHROME\s*=\s*True/OPEN_IN_CHROME   = False/' majors_screener.py
+          sed -i 's/OPEN_IN_CHROME\s*=\s*True/OPEN_IN_CHROME   = False/' "RSPS TOP10_"
 
       - name: Run screener (generates PNG/CSV/HTML and posts to Discord)
-        run: python majors_screener.py
+        run: python "RSPS TOP10_"
 
       - name: Upload artifacts (PNG/CSV/HTML)
         uses: actions/upload-artifact@v4
@@ -64,3 +64,4 @@ jobs:
             majors_screener_daily.csv
             majors_screener_daily.html
           if-no-files-found: warn
+
