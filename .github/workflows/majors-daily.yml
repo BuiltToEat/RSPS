@@ -1,0 +1,66 @@
+name: Majors Screener Daily (Discord)
+
+on:
+  schedule:
+    # 00:05 UTC ≈ 11:05 AM Australia/Sydney during DST
+    - cron: "5 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: majors-screener-daily
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      TZ: Australia/Sydney
+      CRYPTOCOMPARE_API_KEY: ${{ secrets.CRYPTOCOMPARE_API_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade requests pandas numpy matplotlib
+
+      # Optional guard: allow small delays; only run 11:05–11:20 Sydney time
+      - name: Gate by local time (Sydney)
+        run: |
+          HOUR=$(date +'%H')
+          MIN=$(date +'%M')
+          if [ "$HOUR" != "11" ] || [ "$MIN" -lt 5 ] || [ "$MIN" -gt 20 ]; then
+            echo "Outside the allowed 11:05–11:20 window for Australia/Sydney. Exiting without error."
+            exit 0
+          fi
+
+      # Headless CI: don't try to open Chrome
+      - name: Disable Chrome auto-open for CI
+        run: |
+          sed -i 's/OPEN_IN_CHROME\s*=\s*True/OPEN_IN_CHROME   = False/' majors_screener.py
+
+      - name: Run screener (generates PNG/CSV/HTML and posts to Discord)
+        run: python majors_screener.py
+
+      - name: Upload artifacts (PNG/CSV/HTML)
+        uses: actions/upload-artifact@v4
+        with:
+          name: majors-screener-${{ github.run_id }}
+          path: |
+            majors_rsps_backtest_vs_btc.png
+            majors_screener_table.png
+            majors_screener_daily.csv
+            majors_screener_daily.html
+          if-no-files-found: warn
