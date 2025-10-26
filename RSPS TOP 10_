@@ -1,6 +1,5 @@
 # Majors Top-10 Screener — Safe Mode (Auto-open in Google Chrome)
-# Backtest (2025-01-01 → today) vs BTC + Table PNG + optional HTML/CSV
-# Universe: BTC, ETH, BNB, SOL, XRP, ADA, DOGE, TON, TRX, LINK
+# Backtest (2025-01-01 → today) vs BTC + Table PNG + optional HTML/CSV + Discord post
 
 import os, sys, time, math, random, shutil, webbrowser, subprocess
 from datetime import datetime, date
@@ -31,7 +30,12 @@ OUT_TABLE_PNG    = "majors_screener_table.png"
 OUT_HTML         = "majors_screener_daily.html"
 OUT_CSV          = "majors_screener_daily.csv"
 WRITE_HTML_CSV   = True
-OPEN_IN_CHROME   = True
+OPEN_IN_CHROME   = True  # workflow flips this to False on CI
+
+# ---- Discord (hard-coded) ----
+POST_TO_DISCORD       = True
+DISCORD_WEBHOOK_URL   = "https://canary.discord.com/api/webhooks/1431869296484552734/zxoFGOFClv8JeZWfcLaZGbyv0wBfcyyYWuvNGVOIwFQJbZVDvKQIdzwq3NVgMbAbB6zh"
+DISCORD_USERNAME      = "RSPS TOP 10_"
 
 CRYPTOCOMPARE_API_KEY = os.getenv("CRYPTOCOMPARE_API_KEY", "").strip()
 EXCHANGES_TRY = ["BINANCE","BYBIT","OKX","KUCOIN","BITGET","GATEIO","KRAKEN","COINBASE", None]
@@ -439,16 +443,9 @@ def backtest(C,H,L,V,VT, start=None, end=None):
 
 # ============================= PNG: render table (COLORED) =============================
 def _posneg_shade(val, scale=1.0):
-    """Return facecolor for signed values."""
     if pd.isna(val) or val == 0: return None
     v = float(val)
-    cap = 30.0  # cap magnitude for intensity
-    t = min(abs(v), cap) / cap
-    if v > 0:
-        # blend toward green
-        return C_POS_BASE
-    else:
-        return C_NEG_BASE
+    return C_POS_BASE if v > 0 else C_NEG_BASE
 
 def _set_cell_face(cell, color, edge=None):
     if color:
@@ -462,7 +459,6 @@ def save_table_png(df, meta, path, max_rows=15):
     cols = [c for c in cols if c in show.columns]
     show = show[cols]
 
-    # Format strings
     def fmt(series, spec): return series.map(lambda x: spec.format(x) if pd.notna(x) else "")
     mapf = {
         "Confidence %":"{:.1f}","Score":"{:.1f}","Entry %":"{:.1f}",
@@ -487,7 +483,6 @@ def save_table_png(df, meta, path, max_rows=15):
     the_table.set_fontsize(9)
     the_table.scale(1.0, 1.25)
 
-    # Base styling
     for (r, c), cell in the_table.get_celld().items():
         if r == 0:
             _set_cell_face(cell, C_HDR)
@@ -497,10 +492,8 @@ def save_table_png(df, meta, path, max_rows=15):
             _set_cell_face(cell, row_bg)
             cell.set_text_props(color=C_TEXT)
 
-    # Column indices helper
     col_index = {name:i for i,name in enumerate(show.columns, start=0)}
 
-    # SIGNAL colors
     if "Signal" in col_index:
         cidx = col_index["Signal"]
         for r in range(1, len(show)+1):
@@ -512,17 +505,14 @@ def save_table_png(df, meta, path, max_rows=15):
             else: _set_cell_face(cell, C_NOTRADE)
             cell.set_text_props(color="black", weight="bold")
 
-    # RISK GAUGE colors
     if "Risk Gauge" in col_index:
         cidx = col_index["Risk Gauge"]
         for r in range(1, len(show)+1):
             cell = the_table[r, cidx]
             text = show.iloc[r-1]["Risk Gauge"]
-            if text == "RISK_ON": _set_cell_face(cell, C_RISK_ON)
-            else: _set_cell_face(cell, C_RISK_OFF)
+            _set_cell_face(cell, C_RISK_ON if text=="RISK_ON" else C_RISK_OFF)
             cell.set_text_props(color="white", weight="bold")
 
-    # Signed numeric shades
     signed_cols = [c for c in ["3d Return","7d Return","14d Return","Vol. Trend","Momentum","Sharpe 7d","EMA Diff"] if c in col_index]
     for sc in signed_cols:
         cidx = col_index[sc]
@@ -531,21 +521,17 @@ def save_table_png(df, meta, path, max_rows=15):
             col = _posneg_shade(raw_val)
             if col: _set_cell_face(the_table[r, cidx], col, edge=C_POS_EDGE if raw_val>0 else C_NEG_EDGE)
 
-    # RSI thresholds
     if "RSI Short" in col_index:
         cidx = col_index["RSI Short"]
         for r in range(1, len(show)+1):
             v = df.loc[df["Rank"]==int(show.iloc[r-1]["Rank"]), "RSI Short"].values[0]
-            col = C_POS_BASE if v >= 55 else C_NEG_BASE
-            _set_cell_face(the_table[r, cidx], col)
+            _set_cell_face(the_table[r, cidx], C_POS_BASE if v >= 55 else C_NEG_BASE)
     if "RSI Med" in col_index:
         cidx = col_index["RSI Med"]
         for r in range(1, len(show)+1):
             v = df.loc[df["Rank"]==int(show.iloc[r-1]["Rank"]), "RSI Med"].values[0]
-            col = C_POS_BASE if v >= 50 else C_NEG_BASE
-            _set_cell_face(the_table[r, cidx], col)
+            _set_cell_face(the_table[r, cidx], C_POS_BASE if v >= 50 else C_NEG_BASE)
 
-    # Bars: Confidence % (green) and Suggested Wt % (gray)
     def add_bar(r, cidx, pct, color):
         cell = the_table[r, cidx]
         x, y = cell.get_x(), cell.get_y()
@@ -573,7 +559,6 @@ def save_table_png(df, meta, path, max_rows=15):
 
 # ============================= HTML (simple & matching colors) =============================
 def style_table_simple(df, meta):
-    # Build colored HTML similar to PNG
     def td(txt, style): return f"<td style='{style}'>{txt}</td>"
     def th(txt): return f"<th style='background:{C_HDR};color:{C_TEXT_HDR};padding:6px 8px;border:1px solid #333;text-transform:uppercase;letter-spacing:.02em'>{txt}</th>"
 
@@ -608,7 +593,6 @@ def style_table_simple(df, meta):
                     else:
                         bg = C_POS_BASE if fv>0 else C_NEG_BASE if fv<0 else base
                     s = s.replace(base, bg)
-            # bars in HTML
             if c in ["Confidence %","Suggested Wt %"]:
                 try:
                     pct = float(val)
@@ -644,6 +628,54 @@ def save_html_simple(html, path):
             + html +
             "</body></html>"
         )
+
+# ============================= DISCORD =============================
+def post_to_discord(meta, table_png, backtest_png, csv_path=None, html_path=None):
+    if not POST_TO_DISCORD or not DISCORD_WEBHOOK_URL:
+        log("Discord post skipped (disabled or missing webhook).")
+        return
+    content = (
+        f"**RSPS TOP 10 — {meta['today'].date()}**\n"
+        f"• Breadth (Entry≥{ENTRY_OK_THRESHOLD:.0f}%): **{meta['breadth']:.1f}%**\n"
+        f"• Exposure scale: **{meta['exposure']*100:.0f}%**\n"
+        f"• Total alloc: **{meta['alloc_sum']:.1f}%**"
+    )
+    files = {}
+    file_index = 0
+
+    def add_file(path):
+        nonlocal file_index
+        if path and os.path.exists(path):
+            files[f"files[{file_index}]"] = (os.path.basename(path), open(path, "rb"))
+            file_index += 1
+
+    add_file(backtest_png)
+    add_file(table_png)
+    add_file(csv_path)   # attach CSV; HTML is optional in Discord
+
+    payload = {
+        "content": content,
+        "username": DISCORD_USERNAME
+    }
+    try:
+        resp = requests.post(DISCORD_WEBHOOK_URL, data={"payload_json": json_dumps(payload)}, files=files, timeout=60)
+        if resp.status_code >= 300:
+            log(f"Discord webhook failed: {resp.status_code} {resp.text}")
+        else:
+            log("Posted update to Discord.")
+    except Exception as e:
+        log(f"Discord error: {e}")
+    finally:
+        for f in files.values():
+            try:
+                f[1].close()
+            except:  # noqa
+                pass
+
+def json_dumps(obj):
+    # lightweight local JSON dumps to avoid importing full json earlier in file
+    import json as _json
+    return _json.dumps(obj, separators=(",", ":"))
 
 # ============================= MAIN =============================
 def main():
@@ -711,8 +743,15 @@ def main():
         print("  •", os.path.abspath(OUT_CSV))
         print("  •", os.path.abspath(OUT_HTML))
 
+    # ---- Discord post (hard-coded webhook + username) ----
+    try:
+        post_to_discord(meta, OUT_TABLE_PNG, OUT_BACKTEST_PNG, csv_path=OUT_CSV, html_path=OUT_HTML)
+    except Exception as e:
+        log(f"Discord post exception: {e}")
+
 if __name__ == "__main__":
     main()
+
 
 
 
